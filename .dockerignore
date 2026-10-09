@@ -1,0 +1,29 @@
+# git
+.git
+.gitignore
+
+# uv本地虚拟环境
+.venv
+.uv
+
+# python缓存
+__pycache__
+*.pyc
+
+# IDE
+.idea
+.vscode
+
+# 本地chroma向量数据库，容器启动重新生成，不要打包
+rag/chroma_db/*
+
+# 本地huggingface模型缓存
+~/.cache/huggingface
+
+# 本地环境变量，禁止打入镜像
+.env
+*.env
+
+# 日志、临时文件
+logs
+*.log
