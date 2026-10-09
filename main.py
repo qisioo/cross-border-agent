@@ -24,6 +24,10 @@ from rag.build_vector_db import build_vector_and_bm25
 async def lifespan(app: FastAPI):
     global agent_graph
     print("===== Agent Graph 初始化 =====")
+    # ==========【Skill规则预加载】启动时预加载skill/rules全部分片进内存（渐进式加载Level1），Skill结果优先 ==========
+    from utils.skill_loader import get_skill_loader
+    get_skill_loader()
+    # ======================================================================
     # 构建真实向量库和BM25检索器
     hybrid_retriever = build_vector_and_bm25(full_rebuild=False)
     hybrid_retriever.load_reranker()

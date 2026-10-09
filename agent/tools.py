@@ -335,12 +335,17 @@ def listing_generate(product_info: Dict[str, Any], target_market: str, trace_id:
         # 序列化商品信息，防止字典直接转字符串格式混乱
         product_json_str = json.dumps(product_info, ensure_ascii=False, indent=2)
 
+        # ==========【Skill规则注入】B类固定规则下沉到skill/rules/listing.md，Skill结果优先，失败抛错走上层重试 ==========
+        from utils.skill_loader import get_skill_loader
+        listing_rule = get_skill_loader().load_rule("listing")
+        if not listing_rule:
+            raise Exception("Listing业务规则加载失败（skill/rules/listing.md缺失），无法生成")
+        # ======================================================================
+
         base_prompt = f"""你是亚马逊跨境Listing文案专家，根据商品信息生成英文Listing。
-【硬性规则】
-1. title：英文，长度60~120字符；
-2. bullet_points：必须5条英文卖点；
-3. ad_copy：简短英文广告介绍，80字符以内；
-4. 只输出JSON，禁止```json标记、注释、多余文字。
+请严格遵守以下Listing业务规则：
+{listing_rule}
+
 {format_instruct}
 
 商品信息：
@@ -362,8 +367,8 @@ def listing_generate(product_info: Dict[str, Any], target_market: str, trace_id:
             logger.warning(
                 f"[listing_generate][trace_id={trace_id}] Listing格式校验失败，第{retry+1}次重试生成，raw_output={raw_resp[:200]}"
             )
-            # 重试追加提示，纠正LLM
-            current_prompt = base_prompt + "\n上一轮输出格式校验失败，请严格遵守schema、字符长度限制，仅输出干净JSON。"
+            # 重试追加提示，纠正LLM（固定校验规则已由Skill注入，此处仅保留任务指令）
+            current_prompt = base_prompt + "\n上一轮输出格式校验失败，请重新生成并严格遵守上述业务规则与输出格式要求。"
 
         logger.info(
             f"[listing_generate][trace_id={trace_id}] Listing生成结束，实际重试次数={actual_retry_count}, max_retry={max_retry}"
@@ -398,13 +403,21 @@ def sales_data_query(user_query: str, trace_id: str) -> Dict[str, Any]:
         llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
         max_retry = 2
         params = None
-        # 关键修复：JSON示例的大括号全部转义成双大括号，避免format识别为占位符
-        base_prompt = """从用户提问提取商品ID(product_id)、月份(month，格式YYYY-MM)。
-没有识别到则字段返回null。仅输出JSON，禁止多余文字、markdown标记。
-输出示例：{{"product_id":"SKU001","month":"2026-09"}}
-用户问题：{query}
-"""
-        current_prompt = base_prompt.format(query=user_query)
+        # ==========【Skill规则注入】B类字段规范下沉到skill/rules/sales.md，Skill结果优先，失败抛错走上层重试 ==========
+        from utils.skill_loader import get_skill_loader
+        sales_rule = get_skill_loader().load_rule("sales")
+        if not sales_rule:
+            raise Exception("销售查询业务规则加载失败（skill/rules/sales.md缺失），无法执行")
+        # ======================================================================
+
+        # 直接拼接避免.format与规则内JSON示例花括号冲突
+        base_prompt = (
+            "从用户提问提取商品ID(product_id)、月份(month)。\n"
+            "请严格遵守以下销售查询业务规则：\n"
+            f"{sales_rule}\n\n"
+            f"用户问题：{user_query}\n"
+        )
+        current_prompt = base_prompt
 
         for retry in range(max_retry):
             raw_resp = llm.invoke(current_prompt).content
@@ -447,8 +460,7 @@ def sales_data_query(user_query: str, trace_id: str) -> Dict[str, Any]:
                 break
 
             logger.warning(f"[sales_data_query][trace_id={trace_id}] 参数提取失败，第{retry + 1}次重试，LLM原始输出前200字：{clean_text[:200]}")
-            current_prompt = base_prompt.format(
-                query=user_query) + "\n上一轮参数提取失败，请严格输出裸JSON，不要加引号、不要markdown。"
+            current_prompt = base_prompt + "\n上一轮参数提取失败，请严格输出裸JSON，不要加引号、不要markdown。"
 
         if params is None or params.product_id is None or params.month is None:
             raise Exception("无法从用户语句解析出商品ID或者月份，重试耗尽")
