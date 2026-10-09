@@ -617,20 +617,24 @@ def result_collect_node(state: GraphState):
         final_answer = "暂时没有找到相关信息。"
         print(f"[result_collect_node][trace_id={trace_id}] 无参考素材，使用兜底回答")
     else:
-        # 强约束系统提示词：仅能基于传入的raw_source_data优化，禁止新增额外信息、禁止引入知识库其他内容
-        system_prompt = """你是跨境电商运营文本优化助手。严格遵守下面硬性规则： 1. 仅允许使用【原始素材】里面已经存在的信息，**严禁引入外部、知识库、市场额外信息，禁止编造任何内容，禁止切换任务主题**。 2. 对原始素材做排版整理、语句润色，优化阅读体验，**不能直接原样复制输出**。 3. 删除所有内部标记：【子任务】、调试日志、内部字段标记，最终回答只保留面向用户的正文。 4. 如果原始素材是结构化字典，转换成通顺自然的业务文本。 5. 不增加任何没有在素材中出现的市场分析、竞品信息。 """
+        # ==========【Skill规则注入】润色固定约束下沉到skill/rules/result_collect.md，Skill结果优先，失败走既有兜底 ==========
+        from utils.skill_loader import get_skill_loader
+        # ======================================================================
         user_prompt = f"""当前任务类型：{task_type} 【原始素材】 {raw_source_data} 请基于上面这份原始素材，润色排版，输出面向用户的最终回答。"""
         try:
+            result_collect_rule = get_skill_loader().load_rule("result_collect")
+            if not result_collect_rule:
+                raise Exception("结果汇总润色规则加载失败（skill/rules/result_collect.md缺失）")
             llm = ChatDeepSeek(model="deepseek-chat", temperature=0.3)
             resp = llm.invoke([
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": result_collect_rule},
                 {"role": "user", "content": user_prompt}
             ])
             final_answer = f"{source_label}\n{resp.content.strip()}"
             print(f"[result_collect_node][trace_id={trace_id}] LLM整理后的结果：\n{final_answer}")
         except Exception as e:
             print(f"[result_collect_node][trace_id={trace_id}] LLM文本整理异常: {str(e)}")
-            # LLM调用失败兜底，直接原始素材输出，防止链路崩溃
+            # LLM调用失败或规则缺失兜底，直接原始素材输出，防止链路崩溃
             final_answer = f"{source_label}\n{str(raw_source_data)}"
 
     # 更新agent_state内部字段final_answer

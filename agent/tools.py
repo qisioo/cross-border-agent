@@ -539,13 +539,18 @@ def customer_service_qa(question: str, retrieve_docs: list, trace_id: str) -> Di
         if not context_text.strip():
             answer = "抱歉，知识库中没有找到相关信息，请您更换问题再次咨询。"
         else:
-            prompt = f"""你是跨境电商平台客服，严格仅使用下面提供的知识库内容回答用户问题，**禁止编造知识库不存在的信息**。
-如果知识库没有对应答案，直接回复：抱歉，暂无相关信息。
+            # ==========【Skill规则注入】给LLM的回答约束下沉到skill/rules/customer_service.md，Skill结果优先，失败抛错走外层兜底 ==========
+            from utils.skill_loader import get_skill_loader
+            cs_rule = get_skill_loader().load_rule("customer_service")
+            if not cs_rule:
+                raise Exception("知识库客服问答业务规则加载失败（skill/rules/customer_service.md缺失），无法执行")
+            # ======================================================================
+            prompt = f"""{cs_rule}
 
 知识库参考内容：
 {context_text}
 用户问题：{question}
-请简洁自然输出客服回复，不要额外markdown、标题。
+请基于上述知识库内容输出客服回复。
 """
             llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
             answer = llm.invoke(prompt).content.strip()
