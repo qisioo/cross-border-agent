@@ -1,8 +1,8 @@
 """ 向量库&BM25索引构建脚本
 1.加载rag/knowledge目录下 txt、md知识库文档
 2.过滤空文档，文本切分
-3.Chroma支持【全量重建 / 增量追加】；默认全量重建，防止重复向量堆积
-4.构建Chroma向量库 + 内存BM25索引
+3.Milvus向量库支持【全量重建(drop collection) / 增量追加】；默认全量重建，防止重复向量堆积
+4.构建Milvus向量库(agent03_<tenant_id>) + 内存BM25索引
 ⚠️重要：返回的 HybridRetriever 实例必须由主程序长期持有；实例销毁则BM25内存索引直接丢失
 ⚠️BM25索引无磁盘持久化，服务每次重启都需要重新加载文档重建索引
 """
@@ -20,7 +20,7 @@ from rag.hybrid_retriever import HybridRetriever, DEFAULT_COLLECTION, get_milvus
 
 # 知识库文档目录
 KNOWLEDGE_FOLDER = Path(__file__).parent / "knowledge"
-# 向量库持久化目录
+# 【已废弃】旧Chroma向量库持久化目录；向量库已迁移Milvus，保留常量仅作兼容，不再创建该目录
 CHROMA_DB_FOLDER = Path(__file__).parent / "chroma_db"
 
 
@@ -101,7 +101,7 @@ def build_vector_and_bm25(
 ) -> Optional[HybridRetriever]:
     """
     完整构建流程：加载文档 → 切分 → 写入向量库 → 初始化BM25索引
-    :param full_rebuild: True=全量重建，先删除旧chroma_db目录，避免向量重复；False=增量追加文档
+    :param full_rebuild: True=全量重建(删除旧Milvus collection)，避免向量重复；False=增量追加文档
     :return: HybridRetriever实例，⚠️主程序必须持有此实例，不能丢弃，否则BM25内存索引丢失；失败返回None
     """
     try:

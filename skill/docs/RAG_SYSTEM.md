@@ -1,4 +1,4 @@
-<!-- 文件作用：本项目 RAG 混合检索体系参考文档，如实描述 BM25+Chroma+RRF+Rerank 检索流程、知识库构建流程、中文分词与内存索引特性。需要理解或调整检索/知识库时按需加载本文件。 -->
+<!-- 文件作用：本项目 RAG 混合检索体系参考文档，如实描述 BM25+Milvus+RRF+Rerank 检索流程、多租户知识库构建流程、中文分词与内存索引特性。需要理解或调整检索/知识库时按需加载本文件。 -->
 
 # Agent03 RAG 混合检索体系文档
 
@@ -13,7 +13,7 @@
 ```
 用户查询（rewritten_query，由 query_rewrite 节点生成）
    │
-   ├─► 向量检索  Chroma.similarity_search(top_k=8)
+   ├─► 向量检索  Milvus.similarity_search(top_k=8，按租户 collection)
    ├─► 关键词检索 BM25Retriever.invoke（自定义中文分词器）
    │
    ▼
@@ -45,8 +45,9 @@ md5 去重
   ```
 - 设置 `self.bm25_retriever.k = 3`。
 
-### 2.2 Chroma 向量检索
-- 使用 `langchain_chroma.Chroma`，持久化目录 `rag/chroma_db/`。
+### 2.2 Milvus 向量检索
+- 使用 `langchain_milvus.Milvus`，连接本机 Milvus（`http://127.0.0.1:19530`，Docker standalone）。
+- **多租户隔离**：每个企业独立 collection（`agent03_<tenant_id>`），`auto_id=True`；`full_rebuild=True` 时 `drop_old=True` 删除旧 collection 全量重建。
 - Embedding：BAAI/bge-m3，`HuggingFaceEmbeddings`，CPU 运行，`normalize_embeddings=True`。
 
 ### 2.3 RRF 倒数排名融合
@@ -63,23 +64,24 @@ md5 去重
 ## 3. 知识库构建流程（rag/build_vector_db.py）
 
 ```
-读取 rag/knowledge/ 下 txt、md（UTF-8）
+读取 企业知识库目录 rag/knowledge/<tenant_id>/ 下 txt、md（UTF-8）
    → 过滤空文档、逐行清除行尾空白、压缩空行
    → RecursiveCharacterTextSplitter(chunk_size=220, overlap=45) 切分
      （separators=["\n\n","\n","。",". ","，",","," "]）
    → 文本内容去重（set 去重，保留首个）
-   → [可选] 删除旧 chroma_db（full_rebuild=True）
+   → [可选] 删除旧 collection（full_rebuild=True，load_embedding(drop_old=True)）
    → 加载 BGE-M3 embedding（CPU）
-   → 写入 Chroma 向量库（add_documents）
+   → 写入 Milvus collection（agent03_<tenant_id>，add_documents 分批）
    → 构建内存 BM25 索引（build_bm25_index）
    → 返回 HybridRetriever 实例（必须全程持有）
 ```
 
-### 3.1 构建入口 `build_vector_and_bm25(full_rebuild)`
-- `full_rebuild=True`：先 `shutil.rmtree(CHROMA_DB_FOLDER)` 清空旧向量库，再全量重建，防止重复向量堆积。
-- `full_rebuild=False`：增量追加；若向量库已有数据则跳过写入（不重复追加）。
-- 加载 embedding 后写入向量库，再构建内存 BM25 索引，最后返回 `HybridRetriever` 实例。
-- main.py 的 lifespan 中调用 `build_vector_and_bm25(full_rebuild=False)`，加载 reranker 后构建 Agent 图。
+### 3.1 构建入口 `build_tenant_retriever(tenant_id, full_rebuild)`（多租户）
+- 读取 `rag/knowledge/<tenant_id>/`，构建到 Milvus collection `agent03_<tenant_id>`。
+- `full_rebuild=True`：`load_embedding(drop_old=True)` 删除旧 collection 再全量重建，防止重复向量堆积。
+- `full_rebuild=False`：复用已有 collection，`get_milvus_row_count`>0 则跳过写入。
+- 支持 `progress_callback` 回传进度（0-100），用于上传接口的"正在构建向量数据库"进度条。
+- 构建完成后由上传接口注册到 `TenantRetrieverRegistry`；main.py 启动创建空注册表（纯隔离，不构建公共默认库）。
 
 ### 3.2 切分参数
 - `chunk_size=220`，`chunk_overlap=45`，按 `\n\n、\n、。、. 、，、, 、空格` 分层切分。
@@ -90,9 +92,9 @@ md5 去重
 ## 4. 重要特性与注意事项（红线）
 
 1. **BM25 索引仅内存态**：`build_bm25_index` 构建的索引只存在内存中，进程销毁即丢失；服务每次重启必须基于全部切片文档重新构建。
-2. **retriever 实例必须全程持有**：返回的 `HybridRetriever` 实例若被丢弃，BM25 内存索引直接丢失。main.py 通过 lifespan 持有全局 `hybrid_retriever`。
+2. **retriever 实例必须全程持有**：返回的 `HybridRetriever` 实例若被丢弃，BM25 内存索引直接丢失。多租户下由 `TenantRetrieverRegistry` 长期持有各企业实例。
 3. **HF 镜像前置**：`HF_ENDPOINT=https://hf-mirror.com` 必须放在所有 huggingface 相关 import 之前（build_vector_db.py 顶部第 11 行已设置）。
-4. **加载顺序**：`load_embedding()` 初始化 embedding 与 Chroma；`load_reranker()` 延迟加载重排序模型（可在构建后单独调用）。
+4. **加载顺序**：`load_embedding()` 初始化 embedding 并连接/创建 Milvus collection；`load_reranker()` 延迟加载重排序模型（多租户下全局共享，显式调用 `enable_shared_reranker()`；内存紧张时默认用 RRF+去重）。
 5. **异常降级**：向量检索、BM25 检索、reranker 均带异常捕获，出错降级为空列表/降级结果，不中断 Agent 流程。
 
 ---
@@ -105,7 +107,7 @@ md5 去重
 | rewritten_query | agent/state.py AgentState | query_rewrite 节点写入，用于检索与意图判断 |
 | answer_source | agent/state.py AgentState | 回答来源标记：platform_knowledge / llm_knowledge |
 
-`do_retrieve_node` 调用 `hybrid_retriever.hybrid_search(rewritten_query, top_k=8)` 后将结果写入 `retrieved_chunks`。
+`do_retrieve_node` 按 `state.tenant_id` 从租户注册表取对应企业的检索器，调用 `hybrid_search(rewritten_query, top_k=8)` 后将结果写入 `retrieved_chunks`；该企业未构建知识库时返回空检索（纯隔离）。
 
 ---
 

@@ -1,6 +1,6 @@
 # 跨境电商智能运营 Agent（Agent03）
 
-面向跨境电商运营场景的垂直领域智能 Agent。基于 LangGraph 显式状态机编排，将竞品分析、商品信息抓取、Listing 文案生成、销售数据自然语言查询、知识库客服问答五大重复性工作自动化，配合 BM25+Chroma 混合检索 RAG 与 FastAPI 服务封装，支持 Docker 一键部署与 LangSmith 全链路可观测。
+面向跨境电商运营场景的垂直领域智能 Agent。基于 LangGraph 显式状态机编排，将竞品分析、商品信息抓取、Listing 文案生成、销售数据自然语言查询、知识库客服问答五大重复性工作自动化，配合 BM25+Milvus 混合检索 RAG（多租户企业知识库隔离）与 FastAPI 服务封装，配套 Streamlit 前端工作台，支持 Docker 一键部署与 LangSmith 全链路可观测。
 
 ---
 
@@ -21,7 +21,7 @@
 - **语言/框架**：Python ≥3.11、FastAPI、Pydantic v2
 - **Agent 编排**：LangGraph（StateGraph 显式状态机 + MemorySaver checkpoint）
 - **LLM**：LangChain + DeepSeek（`deepseek-chat`）
-- **检索**：Chroma 向量库 + BM25 + RRF 融合 + BGE-reranker 重排序
+- **检索**：Milvus 向量库（多租户 `agent03_<tenant_id>` collection）+ BM25 + RRF 融合 + BGE-reranker 重排序
 - **Embedding**：BAAI/bge-m3（CPU，HF 国内镜像）
 - **部署**：Docker（python:3.11-slim + uv）、uv 依赖管理
 - **可观测**：LangSmith（环境变量开关，非强依赖）
@@ -35,6 +35,7 @@
 ```
 Agent03/
 ├── main.py                  # FastAPI 主入口
+├── streamlit_app.py         # Streamlit 前端工作台
 ├── pyproject.toml           # 依赖与构建配置
 ├── Dockerfile               # 镜像构建
 ├── uv.lock                  # 依赖锁定
@@ -52,9 +53,9 @@ Agent03/
 ├── rag/
 │   ├── build_vector_db.py   # 知识库构建
 │   ├── hybrid_retriever.py  # 混合检索
-│   ├── knowledge/           # 知识库文档（txt/md）
+│   ├── knowledge/           # 知识库文档（按企业子目录隔离）
+│   ├── tenant_registry.py   # 租户检索注册表（多租户隔离）
 │   ├── sales_data.csv       # 销售数据
-│   └── chroma_db/           # Chroma 向量库
 └── utils/
     └── helper.py            # 通用工具函数
 ```
@@ -85,7 +86,7 @@ uv run python -m main
 - Swagger 调试页：`http://127.0.0.1:8000/docs`
 - 健康检查：`http://127.0.0.1:8000/health`
 
-> 服务启动时 lifespan 会构建知识库向量库、加载 BGE-M3 embedding 与 reranker，首次耗时较长属正常现象。
+> 服务启动时创建多租户检索注册表（纯隔离，不构建公共默认库）。每个企业的知识库由上传接口按 tenant_id 构建进 Milvus（collection `agent03_<tenant_id>`），BGE-M3 embedding 首次加载耗时较长属正常现象。
 
 ---
 
@@ -98,11 +99,13 @@ uv run python -m main
 ```json
 {
   "user_query": "查询SKU-B002在2026-08的销售数据",
-  "session_id": "sess-001"
+  "session_id": "sess-001",
+  "tenant_id": "enterprise_a"
 }
 ```
 - `user_query`：必填，用户提问，长度 ≤800 字符。
 - `session_id`：选填，多轮会话标识。
+- `tenant_id`：选填，企业/租户标识（默认 `default`）。多租户知识库隔离：对话线程以 `tenant_id:session_id` 隔离，检索只用该企业的知识库。
 
 **响应体**
 ```json
@@ -128,6 +131,12 @@ uv run python -m main
 
 ### GET `/health`
 探活接口，返回 `{"status": "ok"}` 表示服务已就绪。
+
+### POST `/api/tenant/upload`
+上传企业知识库文档（txt/md/csv），按 `tenant_id` 异步构建该企业独立向量库（Milvus collection `agent03_<tenant_id>`）与 BM25 索引，返回 `task_id` 供进度查询。**纯隔离**：各企业知识库互不共享。
+
+### GET `/api/tenant/build/{task_id}`
+查询企业知识库构建进度，返回 `{status, progress, message}`，前端用于进度条轮询（"正在构建向量数据库"）。
 
 ---
 
@@ -166,8 +175,8 @@ docker rm -f agent03_container   # 删除容器（不影响镜像）
 
 ## 7. 知识库管理
 
-- 知识库文档存放于 `rag/knowledge/`，支持 UTF-8 编码的 txt / md 文件。
-- 新增文档放入该目录后，重启服务或调用构建函数即可入库。
+- **多租户纯隔离**：每个企业的知识库独立存放于 `rag/knowledge/<tenant_id>/`，独立构建 Milvus collection（`agent03_<tenant_id>`）与内存 BM25 索引，企业间互不污染。
+- 通过前端工作台（`streamlit_app.py`）或 `POST /api/tenant/upload` 上传企业文档（txt/md/csv），后端异步构建并返回进度。
 - 销售数据存放于 `rag/sales_data.csv`，字段：`product_id, month, sales_volume, revenue, conversion_rate`。
 
 ---

@@ -6,10 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.15.0",
-    "chromadb",
     "fastapi>=0.141.1",
     "langchain>=1.4.0",
-    "langchain-chroma>=1.1.0",
     "langchain-community>=0.4.2",
     "langchain-deepseek>=1.1.0",
     "langchain-huggingface>=1.2.2",

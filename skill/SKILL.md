@@ -1,6 +1,6 @@
 ---
 name: agent03
-description: 跨境电商智能运营 Agent（Agent03）项目的开发与维护 Skill。用于对本项目进行代码维护、功能扩展、Bug 定位、业务理解、运行部署、接口调用。项目基于 LangGraph 显式状态机编排，覆盖竞品分析、商品信息抓取、Listing 文案生成、销售数据自然语言查询、知识库客服问答五大业务场景，并具备 BM25+Chroma 混合检索 RAG、FastAPI 服务封装、Docker 容器化、LangSmith 可观测等工程能力。触发词：Agent03、跨境电商运营助手、跨境智能运营、销售数据查询、竞品分析、Listing、客服问答、混合检索。
+description: 跨境电商智能运营 Agent（Agent03）项目的开发与维护 Skill。用于对本项目进行代码维护、功能扩展、Bug 定位、业务理解、运行部署、接口调用。项目基于 LangGraph 显式状态机编排，覆盖竞品分析、商品信息抓取、Listing 文案生成、销售数据自然语言查询、知识库客服问答五大业务场景，并具备 BM25+Milvus 混合检索 RAG（多租户企业知识库隔离）、FastAPI 服务封装、Streamlit 前端工作台、Docker 容器化、LangSmith 可观测等工程能力。触发词：Agent03、跨境电商运营助手、跨境智能运营、销售数据查询、竞品分析、Listing、客服问答、混合检索。
 ---
 
 # 跨境电商智能运营 Agent（Agent03）维护开发 Skill
@@ -34,7 +34,7 @@ description: 跨境电商智能运营 Agent（Agent03）项目的开发与维护
 - 语言/框架：Python ≥3.11、FastAPI、Pydantic v2
 - Agent 编排：LangGraph（StateGraph 显式状态机 + MemorySaver checkpoint）
 - LLM：LangChain + DeepSeek（`langchain-deepseek`，model=`deepseek-chat`）
-- 检索：Chroma 向量库 + BM25（rank-bm25）+ RRF 融合 + BGE-reranker 重排序
+- 检索：Milvus 向量库（多租户 `agent03_<tenant_id>` collection）+ BM25（rank-bm25）+ RRF 融合 + BGE-reranker 重排序
 - Embedding：BAAI/bge-m3（CPU，HF 国内镜像 hf-mirror.com）
 - 部署：Docker（python:3.11-slim，uv 管理依赖）、uv
 - 可观测：LangSmith（环境变量开关控制，非强依赖）
@@ -69,10 +69,10 @@ Agent03/
 │   └── output_parsers.py    # LLM 输出解析与 Pydantic 校验
 ├── rag/
 │   ├── build_vector_db.py   # 知识库加载、切分、向量库+BM25 构建
-│   ├── hybrid_retriever.py  # 混合检索：BM25+Chroma+RRF+Rerank
+│   ├── hybrid_retriever.py  # 混合检索：BM25+Milvus+RRF+Rerank
 │   ├── knowledge/           # 知识库文档（txt/md，UTF-8）
 │   ├── sales_data.csv       # 销售数据
-│   └── chroma_db/           # Chroma 向量库持久化目录
+│   ├── tenant_registry.py   # 租户检索注册表（多租户隔离）
 └── utils/
     └── helper.py            # trace_id、update_agent_state、文本/字典工具
 ```
@@ -159,7 +159,7 @@ pre_rag_retrieve ──► query_rewrite ──► boundary_judge
 | 任务类型 | 对应文档 | 内容 |
 | ---- | ---- | ---- |
 | 理解业务流程、节点细节、状态流转、任务分发 | `docs/BUSINESS_FLOW.md` | 完整执行链路、五大任务判定、各节点读写、服务请求处理 |
-| RAG 检索、知识库构建、混合检索调优 | `docs/RAG_SYSTEM.md` | BM25+Chroma+RRF+Rerank 细节、知识库构建流程、分词器、内存索引特性 |
+| RAG 检索、知识库构建、混合检索调优 | `docs/RAG_SYSTEM.md` | BM25+Milvus+RRF+Rerank 细节、多租户知识库构建流程、分词器、内存索引特性 |
 | 接口调用、参数格式、错误码 | `docs/API_REFERENCE.md` | /api/agent/run 与 /health 规范、请求/响应体、错误码、lifespan |
 | 本地运行、Docker 部署、LangSmith 配置 | `docs/DEPLOY_GUIDE.md` | 运行步骤、镜像构建、容器启动、运维命令、LangSmith 环境变量 |
 
