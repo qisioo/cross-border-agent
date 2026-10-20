@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import List, Optional
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from rag.hybrid_retriever import HybridRetriever
+from rag.hybrid_retriever import HybridRetriever, DEFAULT_COLLECTION, get_milvus_row_count
 
 # 知识库文档目录
 KNOWLEDGE_FOLDER = Path(__file__).parent / "knowledge"
@@ -111,22 +111,17 @@ def build_vector_and_bm25(
         split_docs = split_documents(raw_docs)
         print(f"文档切分完成，有效文本块数量：{len(split_docs)}")
 
-        # ==========仅调整顺序：先删除旧向量库，再实例化retriever==========
-        if full_rebuild and CHROMA_DB_FOLDER.exists():
-            shutil.rmtree(CHROMA_DB_FOLDER)
-            print("[全量重建模式]已清空旧Chroma向量库")
-
-        retriever = HybridRetriever(persist_directory=str(CHROMA_DB_FOLDER))
+        # ==========【Milvus 全量重建/增量语义】==========
+        # full_rebuild=True：load_embedding(drop_old=True) 删除旧collection重建，防重复向量堆积
+        # full_rebuild=False：复用已有collection，row_count>0 则跳过写入（不再依赖chroma目录删除）
+        print("[Milvus] 连接本机 Milvus standalone，collection:", DEFAULT_COLLECTION)
+        retriever = HybridRetriever(collection_name=DEFAULT_COLLECTION)
         # 加载BGE‑M3 embedding模型
         print("[开始加载Embedding模型 BGE-M3]")
-        retriever.load_embedding()
+        retriever.load_embedding(drop_old=full_rebuild)
         print("[Embedding模型加载完成]")
         # 写入向量库
-        existing_count = 0
-        try:
-            existing_count = retriever.vector_store._collection.count()
-        except Exception:
-            existing_count = 0
+        existing_count = get_milvus_row_count(retriever.collection_name)
         if full_rebuild or existing_count == 0:
             retriever.vector_store.add_documents(split_docs)
             print("[向量库写入完成]")

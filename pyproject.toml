@@ -13,9 +13,11 @@ dependencies = [
     "langchain-community>=0.4.2",
     "langchain-deepseek>=1.1.0",
     "langchain-huggingface>=1.2.2",
+    "langchain-milvus>=0.4.0",
     "langgraph>=1.2.11",
     "langgraph-checkpoint>=4.2.0",
     "pydantic>=2.13.5",
+    "pymilvus>=3.0.2",
     "python-dotenv>=1.2.3",
     "pyyaml>=6.0.3",
     "rank-bm25",
@@ -24,7 +26,7 @@ dependencies = [
     "uvicorn>=0.52.4",
 ]
 [[tool.uv.index]]
-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
 
 [dependency-groups]

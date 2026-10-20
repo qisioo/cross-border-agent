@@ -5,9 +5,14 @@ BM25索引仅内存生效，进程销毁索引丢失；程序启动必须传入�
 from typing import List, Tuple, Optional, Dict
 import hashlib
 import re
-from langchain_chroma import Chroma
+from langchain_milvus import Milvus
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
+
+# ==========【Milvus 接入配置】本地 Docker Milvus standalone ==========
+# 向量库独立标识：统一使用 agent03_ 前缀，后续其他项目用不同前缀，互不混淆
+MILVUS_URI = "http://127.0.0.1:19530"
+DEFAULT_COLLECTION = "agent03_kb"
 
 
 def chinese_tokenizer(text: str) -> List[str]:
@@ -24,6 +29,19 @@ def calc_doc_hash(doc: Document) -> str:
     """生成文档片段哈希，用于去重，替代直接对比完整文本"""
     content = doc.page_content.strip()
     return hashlib.md5(content.encode("utf‑8")).hexdigest()
+
+
+def get_milvus_row_count(collection_name: str) -> int:
+    """查询Milvus指定collection的行数，用于增量跳过判断；collection不存在返回0"""
+    try:
+        from pymilvus import MilvusClient
+        client = MilvusClient(uri=MILVUS_URI)
+        if not client.has_collection(collection_name):
+            return 0
+        return int(client.get_collection_stats(collection_name).get("row_count", 0))
+    except Exception as e:
+        print(f"[Milvus行数查询异常] {str(e)}")
+        return 0
 
 
 def reciprocal_rank_fusion(
@@ -62,26 +80,31 @@ def reciprocal_rank_fusion(
 
 
 class HybridRetriever:
-    def __init__(self, persist_directory: str = "./rag/chroma_db"):
+    def __init__(self, persist_directory: str = "./rag/chroma_db", collection_name: str = DEFAULT_COLLECTION):
         self.embedding_func = None
         self.persist_dir = persist_directory
-        self.vector_store: Optional[Chroma] = None
+        self.collection_name = collection_name
+        self.vector_store: Optional[Milvus] = None
         self.bm25_retriever: Optional[BM25Retriever] = None
         # 使用BGE官方FlagReranker
         self.reranker = None
         self.rerank_threshold = 0.15  # 重排序过滤阈值，低于该分数直接丢弃
 
-    def load_embedding(self):
-        """延迟加载本地BGE‑M3 embedding模型，真实业务调用才初始化；自测不会加载大模型"""
+    def load_embedding(self, drop_old: bool = False):
+        """延迟加载本地BGE‑M3 embedding模型并连接/创建 Milvus 向量库；drop_old=True 全量重建(删除旧collection)"""
         from langchain_huggingface import HuggingFaceEmbeddings
         self.embedding_func = HuggingFaceEmbeddings(
             model_name="BAAI/bge-m3",
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True}
         )
-        self.vector_store = Chroma(
-            persist_directory=self.persist_dir,
-            embedding_function=self.embedding_func
+        # 连接本机Milvus；collection不存在自动创建，auto_id=True；drop_old=True删除旧collection重建
+        self.vector_store = Milvus(
+            embedding_function=self.embedding_func,
+            connection_args={"uri": MILVUS_URI},
+            collection_name=self.collection_name,
+            auto_id=True,
+            drop_old=drop_old,
         )
 
     def load_reranker(self):
