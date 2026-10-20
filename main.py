@@ -1,5 +1,8 @@
 """ FastAPI 主入口 优化点：异步ainvoke、输入校验、超时控制、返回字段过滤、异常捕获 """
 import os
+from dotenv import load_dotenv
+# 显式加载 .env 配置（DEEPSEEK_API_KEY 等）；override=True 覆盖进程残留旧值，保证用 .env 的最新密钥
+load_dotenv(override=True)
 os.environ["LANGGRAPH_STRICT_MSGPACK"] = "false"
 
 

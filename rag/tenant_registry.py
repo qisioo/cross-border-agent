@@ -18,14 +18,16 @@ class TenantRetrieverRegistry:
         self._shared_reranker = None
 
     def register(self, tenant_id: str, retriever: HybridRetriever) -> None:
-        """注册/覆盖某租户的检索器（构建完成后调用）；注入全局共享Reranker避免每租户重复占内存"""
+        """注册/覆盖某租户的检索器（构建完成后调用）
+        说明：不在注册时自动加载共享Reranker——BGE-reranker与embedding同进程叠加易内存不足，
+        导致原生段错误(0xC0000005)崩进程。多租户检索默认用 RRF+去重精排；内存宽裕时由调用方显式调用 enable_shared_reranker()。
+        """
         with self._lock:
             self._map[tenant_id] = retriever
-            retriever.reranker = self._load_shared_reranker()
         print(f"[TenantRetrieverRegistry] 注册租户检索器: {tenant_id}")
 
-    def _load_shared_reranker(self):
-        """全局共享BGE-reranker-v2-m3（仅加载一次，供所有租户复用）"""
+    def enable_shared_reranker(self):
+        """全局共享BGE-reranker-v2-m3：显式开启，加载成功后注入所有已注册租户（内存宽裕时调用）"""
         if self._shared_reranker is None:
             try:
                 from FlagEmbedding import FlagReranker
@@ -37,6 +39,10 @@ class TenantRetrieverRegistry:
             except Exception as e:
                 print(f"[TenantRetrieverRegistry] Reranker加载失败，跳过重排序降级RRF+去重: {str(e)}")
                 self._shared_reranker = None
+        if self._shared_reranker is not None:
+            with self._lock:
+                for retriever in self._map.values():
+                    retriever.reranker = self._shared_reranker
         return self._shared_reranker
 
     def get(self, tenant_id: str) -> Optional[HybridRetriever]:
