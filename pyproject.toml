@@ -19,6 +19,7 @@ dependencies = [
     "pydantic>=2.13.5",
     "pymilvus>=3.0.2",
     "python-dotenv>=1.2.3",
+    "python-multipart>=0.0.32",
     "pyyaml>=6.0.3",
     "rank-bm25",
     "requests>=2.34.2",

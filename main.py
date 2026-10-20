@@ -8,10 +8,13 @@ os.environ["LANGGRAPH_STRICT_MSGPACK"] = "false"
 
 import time
 import asyncio
-from typing import Optional
+import uuid
+import threading
+from typing import Optional, Dict
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage
 
@@ -39,6 +42,73 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Agent03智能体服务", lifespan=lifespan)
+
+# ==========【多租户：企业知识库上传 + 异步构建 + 进度查询】==========
+# BUILD_TASKS: task_id -> {"task_id","tenant_id","status","progress"(0-100),"message"}
+# 构建在后台线程执行，前端轮询进度接口展示"正在构建向量数据库 + 进度条"
+BUILD_TASKS: Dict[str, dict] = {}
+
+
+@app.post("/api/tenant/upload")
+async def upload_tenant_knowledge(tenant_id: str = Form(...), file: UploadFile = File(...)):
+    """上传企业知识库文档，异步构建该企业独立向量库(agent03_<tenant_id>)与BM25索引，返回task_id供进度查询"""
+    import re
+    tid = (tenant_id or "").strip()
+    if not tid:
+        raise HTTPException(status_code=400, detail="tenant_id不能为空")
+    # 校验租户id：只允许字母/数字/下划线/连字符（用于Milvus collection命名与目录），长度1-64
+    if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", tid):
+        raise HTTPException(status_code=400, detail="tenant_id只能包含字母/数字/下划线/连字符，长度1-64")
+
+    filename = file.filename or "knowledge.txt"
+    if not (filename.lower().endswith((".txt", ".md", ".csv"))):
+        raise HTTPException(status_code=400, detail="仅支持 txt/md/csv 文档")
+
+    # 保存到该企业专属知识库目录 rag/knowledge/<tenant_id>/（文件层隔离）
+    tenant_dir = Path("rag/knowledge") / tid
+    tenant_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(filename).name  # 防路径穿越
+    save_path = tenant_dir / safe_name
+    content = await file.read()
+    save_path.write_bytes(content)
+    print(f"[upload_tenant_knowledge] 已保存租户 {tid} 文档: {save_path}")
+
+    task_id = uuid.uuid4().hex
+    BUILD_TASKS[task_id] = {
+        "task_id": task_id, "tenant_id": tid, "status": "running",
+        "progress": 0, "message": "正在构建向量数据库...",
+    }
+    # 后台线程异步构建，不阻塞上传请求
+    t = threading.Thread(target=_run_tenant_build, args=(task_id, tid), daemon=True)
+    t.start()
+    return {"task_id": task_id, "tenant_id": tid, "status": "running", "message": "正在构建向量数据库..."}
+
+
+def _run_tenant_build(task_id: str, tenant_id: str):
+    """后台构建租户知识库并注册到租户注册表；进度写入BUILD_TASKS供进度接口轮询"""
+    from rag.build_vector_db import build_tenant_retriever
+    from rag.tenant_registry import get_tenant_registry
+
+    def _cb(p, m):
+        BUILD_TASKS[task_id]["progress"] = p
+        BUILD_TASKS[task_id]["message"] = m
+
+    BUILD_TASKS[task_id]["status"] = "running"
+    retriever = build_tenant_retriever(tenant_id, full_rebuild=True, progress_callback=_cb)
+    if retriever is None:
+        BUILD_TASKS[task_id].update({"status": "failed", "progress": 100, "message": "构建失败，请检查文档内容"})
+    else:
+        get_tenant_registry().register(tenant_id, retriever)
+        BUILD_TASKS[task_id].update({"status": "done", "progress": 100, "message": "构建完成"})
+
+
+@app.get("/api/tenant/build/{task_id}")
+async def get_build_progress(task_id: str):
+    """查询企业知识库构建进度，前端用于进度条轮询"""
+    task = BUILD_TASKS.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="构建任务不存在")
+    return task
 
 # 请求体模型
 class AgentRequest(BaseModel):
