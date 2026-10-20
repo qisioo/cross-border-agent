@@ -11,6 +11,7 @@ class AgentState(BaseModel):
     """
     # 用户输入
     user_query: str = Field(description="用户原始自然语言提问")
+    tenant_id: str = Field(default="default", description="企业/租户唯一标识，用于多租户知识库隔离")
     original_input: str = Field(default="", description="商品链接/关键词/客服问题等原始输入")
     rewritten_query: str = Field(default="",
                                  description="经过LLM优化后的查询，用于RAG检索和知识库判断，user_query保留用户原始输入")
