@@ -13,12 +13,10 @@ from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, AIMessage
 
 from agent.graph_builder import build_graph
-from rag.build_vector_db import build_vector_and_bm25
+from rag.tenant_registry import get_tenant_registry
 from utils.helper import generate_trace_id
 # 全局agent graph实例
 agent_graph = None
-
-from rag.build_vector_db import build_vector_and_bm25
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,10 +26,11 @@ async def lifespan(app: FastAPI):
     from utils.skill_loader import get_skill_loader
     get_skill_loader()
     # ======================================================================
-    # 构建真实向量库和BM25检索器
-    hybrid_retriever = build_vector_and_bm25(full_rebuild=False)
-    hybrid_retriever.load_reranker()
-    agent_graph = build_graph(hybrid_retriever)
+    # 多租户纯隔离：启动创建租户检索注册表（不构建公共默认库）
+    # 每个企业的知识库由上传接口按 tenant_id 单独构建并注册进来
+    tenant_registry = get_tenant_registry()
+    agent_graph = build_graph(tenant_registry)
+    print("===== Agent Graph 初始化完成（多租户纯隔离模式） =====")
     yield
     print("===== 应用退出 =====")
 
@@ -42,6 +41,7 @@ app = FastAPI(title="Agent03智能体服务", lifespan=lifespan)
 class AgentRequest(BaseModel):
     user_query: str
     session_id: Optional[str] = None
+    tenant_id: str = "default"
 
 # 配置常量
 MAX_QUERY_LENGTH = 800
@@ -74,9 +74,12 @@ async def agent_run(req: AgentRequest):
     print(f"[api][trace_id={trace_id}] receive request, query={user_query[:120]}")
 
     session_id = req.session_id or "sess-default-001"
+    tenant_id = (req.tenant_id or "default").strip() or "default"
+    # 多租户：thread_id 前缀租户id，隔离不同企业的对话历史/checkpoint
+    thread_id = f"{tenant_id}:{session_id}"
     config = {
         "configurable": {
-            "thread_id": session_id
+            "thread_id": thread_id
         }
     }
 
@@ -96,6 +99,7 @@ async def agent_run(req: AgentRequest):
     from agent.state import AgentState
     clean_agent_state = AgentState(
         user_query=user_query,
+        tenant_id=tenant_id,
         original_input=user_query,
         product_raw_info=None,
         competitor_report="",

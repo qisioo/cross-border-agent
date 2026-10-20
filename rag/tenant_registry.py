@@ -15,12 +15,29 @@ class TenantRetrieverRegistry:
     def __init__(self):
         self._map: Dict[str, HybridRetriever] = {}
         self._lock = threading.Lock()
+        self._shared_reranker = None
 
     def register(self, tenant_id: str, retriever: HybridRetriever) -> None:
-        """注册/覆盖某租户的检索器（构建完成后调用）"""
+        """注册/覆盖某租户的检索器（构建完成后调用）；注入全局共享Reranker避免每租户重复占内存"""
         with self._lock:
             self._map[tenant_id] = retriever
+            retriever.reranker = self._load_shared_reranker()
         print(f"[TenantRetrieverRegistry] 注册租户检索器: {tenant_id}")
+
+    def _load_shared_reranker(self):
+        """全局共享BGE-reranker-v2-m3（仅加载一次，供所有租户复用）"""
+        if self._shared_reranker is None:
+            try:
+                from FlagEmbedding import FlagReranker
+                self._shared_reranker = FlagReranker(
+                    "BAAI/bge-reranker-v2-m3",
+                    use_fp16=False
+                )
+                print("[TenantRetrieverRegistry] 全局共享Reranker加载完成")
+            except Exception as e:
+                print(f"[TenantRetrieverRegistry] Reranker加载失败，跳过重排序降级RRF+去重: {str(e)}")
+                self._shared_reranker = None
+        return self._shared_reranker
 
     def get(self, tenant_id: str) -> Optional[HybridRetriever]:
         """取某租户的检索器，未注册返回 None"""

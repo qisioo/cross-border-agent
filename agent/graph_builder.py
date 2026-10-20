@@ -40,10 +40,11 @@ from agent.tools import (
 )
 
 # ===================== 已删除此处旧版exec_task_dispatcher函数，统一使用agent.nodes.exec_task_dispatcher =====================
-def build_graph(hybrid_retriever):
+def build_graph(tenant_registry):
     """
     构建并返回编译后的 StateGraph 实例
-    :param hybrid_retriever: 全局混合检索对象 main.py从rag.build_vector_db获取传入
+    :param tenant_registry: 租户检索注册表(rag.tenant_registry.TenantRetrieverRegistry)，main.py创建传入
+                            do_retrieve 按 state.tenant_id 取对应企业的检索器，实现多租户知识库隔离
     :return: compiled_graph
     """
     memory_saver = MemorySaver()
@@ -54,10 +55,10 @@ def build_graph(hybrid_retriever):
     graph.add_node("query_rewrite", query_rewrite_node)
     graph.add_node("boundary_judge", boundary_judge_node)
     graph.add_node("knowledge_judge", need_knowledge_judge_node)
-    graph.add_node("do_retrieve", partial(do_retrieve_node, hybrid_retriever=hybrid_retriever))
+    graph.add_node("do_retrieve", partial(do_retrieve_node, tenant_registry=tenant_registry))
     graph.add_node("task_parser", task_parser_node)
     # 使用 partial 注入参数，规避lambda闭包捕获问题，调用nodes内的exec_task_dispatcher
-    graph.add_node("exec_task", partial(exec_task_dispatcher, hybrid_retriever=hybrid_retriever))
+    graph.add_node("exec_task", partial(exec_task_dispatcher, tenant_registry=tenant_registry))
     graph.add_node("result_collect", result_collect_node)
 
     # ========= 设置入口点【启动首先运行 pre_rag_retrieve】 =========
@@ -123,13 +124,17 @@ if __name__ == "__main__":
     from agent.state import AgentState, GraphState
     from utils.helper import generate_trace_id
 
-    # mock一个retriever，自测不需要真实RAG，兼容top_k参数
+    # mock一个租户注册表，自测不需要真实RAG
     class MockRetriever:
         def hybrid_search(self, query, top_k=None):
             return []
 
-    mock_retriever = MockRetriever()
-    agent_graph = build_graph(mock_retriever)
+    class MockRegistry:
+        def get(self, tenant_id):
+            return MockRetriever()
+
+    mock_registry = MockRegistry()
+    agent_graph = build_graph(mock_registry)
 
     # case1：商品相关query，预期 need_retrieve=True，来源标记 platform_knowledge
     print("\n==== Case1：商品相关问题【简单介绍蓝牙耳机】 ====")

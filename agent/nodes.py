@@ -363,18 +363,24 @@ def need_knowledge_judge_node(state: GraphState):
         answer_source=source_tag
     )
 
-def do_retrieve_node(state: GraphState, hybrid_retriever):
+def do_retrieve_node(state: GraphState, tenant_registry):
     """
     知识库检索节点：仅need_retrieve=True才会进入
-    调用混合RAG召回文档，存入retrieved_chunks
+    按 state.tenant_id 从租户注册表取对应企业的检索器，调用混合RAG召回文档存入retrieved_chunks
+    该企业未构建知识库时返回空检索（纯隔离，不继承任何公共库）
     """
     agent = state["agent_state"]
     trace_id = agent.trace_id
+    tenant_id = agent.tenant_id
     # 改为使用LLM改写后的query进行检索
     rewrite_query = agent.rewritten_query
-    print(f"[do_retrieve_node][trace_id={trace_id}] 执行电商知识库混合检索，改写后query={rewrite_query}")
+    retriever = tenant_registry.get(tenant_id)
+    if retriever is None:
+        print(f"[do_retrieve_node][trace_id={trace_id}] 租户 {tenant_id} 未构建企业知识库，返回空检索")
+        return update_agent_state(state, retrieved_chunks=[])
+    print(f"[do_retrieve_node][trace_id={trace_id}] 租户 {tenant_id} 执行企业知识库混合检索，改写后query={rewrite_query}")
 
-    docs = hybrid_retriever.hybrid_search(rewrite_query, top_k=8)
+    docs = retriever.hybrid_search(rewrite_query, top_k=8)
     new_state = update_agent_state(
         state,
         retrieved_chunks=docs
@@ -396,7 +402,7 @@ def route_knowledge_judge(state: GraphState) -> Literal["do_retrieve_node", "tas
 
 
 
-def exec_task_dispatcher(state: GraphState, hybrid_retriever):
+def exec_task_dispatcher(state: GraphState, tenant_registry):
     """
     任务执行分发节点
     根据 agent.current_task_type 分发到不同业务工具：analysis / listing / customer_service / sales / product_fetch
