@@ -237,7 +237,9 @@ async def conversation_detail_api(tenant_id: str, conversation_id: str):
 
 # 对话级知识库构建（复用 BUILD_TASKS 进度机制，加 conversation_id 标识）
 def _run_conversation_build(task_id: str, tenant_id: str, conversation_id: str):
-    """后台构建对话知识库并注册到注册表(键 tenant::conv)；进度写入BUILD_TASKS供进度接口轮询"""
+    """后台构建对话知识库并注册到注册表(键 tenant::conv)；进度写入BUILD_TASKS供进度接口轮询。
+    若对话下已无任何文档(用户删光了知识库文件)，则清理旧collection与注册状态，避免向量库残留。
+    """
     from rag.build_vector_db import build_conversation_retriever
 
     def _cb(p, m):
@@ -247,7 +249,22 @@ def _run_conversation_build(task_id: str, tenant_id: str, conversation_id: str):
     BUILD_TASKS[task_id]["status"] = "running"
     retriever = build_conversation_retriever(tenant_id, conversation_id, full_rebuild=True, progress_callback=_cb)
     if retriever is None:
-        BUILD_TASKS[task_id].update({"status": "failed", "progress": 100, "message": "构建失败，请检查文档内容"})
+        msg = BUILD_TASKS[task_id].get("message", "")
+        if "无知识库文档" in msg:
+            # 对话下已没有任何文档：移除旧注册项并drop旧collection，避免向量残留与built状态失真
+            get_tenant_registry().remove(f"{tenant_id}::{conversation_id}")
+            try:
+                from pymilvus import MilvusClient
+                client = MilvusClient(uri="http://127.0.0.1:19530")
+                coll = f"agent03_{tenant_id}_{conversation_id}"
+                if client.has_collection(coll):
+                    client.drop_collection(coll)
+                    print(f"[_run_conversation_build] 对话 {tenant_id}::{conversation_id} 无文档，已drop旧collection {coll}")
+            except Exception as e:
+                print(f"[_run_conversation_build] 清理collection异常(可忽略): {e}")
+            BUILD_TASKS[task_id].update({"status": "done", "progress": 100, "message": "无知识库文档，已清空该对话向量库"})
+        else:
+            BUILD_TASKS[task_id].update({"status": "failed", "progress": 100, "message": "构建失败，请检查文档内容"})
     else:
         get_tenant_registry().register(f"{tenant_id}::{conversation_id}", retriever)
         BUILD_TASKS[task_id].update({"status": "done", "progress": 100, "message": "构建完成"})
