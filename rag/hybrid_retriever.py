@@ -38,6 +38,13 @@ def get_milvus_row_count(collection_name: str) -> int:
         client = MilvusClient(uri=MILVUS_URI)
         if not client.has_collection(collection_name):
             return 0
+        # count(*) 聚合查询比 get_collection_stats 的 row_count 更准确（stats 在部分版本/数据量下返回不准）
+        try:
+            res = client.query(collection_name, filter="", output_fields=["count(*)"])
+            if res and res[0]:
+                return int(res[0].get("count(*)", 0))
+        except Exception:
+            pass
         return int(client.get_collection_stats(collection_name).get("row_count", 0))
     except Exception as e:
         print(f"[Milvus行数查询异常] {str(e)}")
