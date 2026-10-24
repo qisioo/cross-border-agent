@@ -1,8 +1,11 @@
 """ 租户检索注册表 tenant_registry.py
-文件作用：按租户(tenant_id)管理各自独立的 HybridRetriever 实例，实现知识库隔离。
-每个租户有自己独立的 Milvus collection(agent03_<tenant_id>) 与内存BM25索引，
-检索时只取本租户的检索器，保证不同企业知识库互不污染。
-线程安全：多租户并发上传/构建/检索时，读写用锁保护。
+文件作用：按"检索key"管理各自独立的 HybridRetriever 实例，实现知识库隔离。
+检索key 语义（统一为字符串）：
+- 企业级知识库：key = tenant_id（如 "enterprise_a"），对应 collection agent03_<tenant_id>（旧上传接口兼容）
+- 对话级知识库：key = f"{tenant_id}::{conversation_id}"（如 "enterprise_a::a1b2c3"），
+  对应 collection agent03_<tenant_id>_<conversation_id>，同企业下不同对话彼此完全隔离
+检索时只取本对话/本企业的检索器，保证不同对话/企业知识库互不污染。
+线程安全：多对话并发上传/构建/检索时，读写用锁保护。
 """
 import threading
 from typing import Dict, Optional
@@ -49,6 +52,18 @@ class TenantRetrieverRegistry:
         """取某租户的检索器，未注册返回 None"""
         with self._lock:
             return self._map.get(tenant_id)
+
+    def get_for(self, tenant_id: str, conversation_id: str = "") -> Optional[HybridRetriever]:
+        """按"企业 + 对话"取检索器（对话级隔离核心）
+        - conversation_id 非空：key = tenant::conversation，只取本对话的知识库，绝不跨对话
+        - conversation_id 为空/默认：key = tenant（兼容旧企业级知识库）
+        """
+        if conversation_id and conversation_id not in ("", "default"):
+            key = f"{tenant_id}::{conversation_id}"
+        else:
+            key = tenant_id
+        with self._lock:
+            return self._map.get(key)
 
     def has(self, tenant_id: str) -> bool:
         """判断某租户是否已构建检索器"""

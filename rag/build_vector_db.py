@@ -217,6 +217,82 @@ def build_tenant_retriever(
         return None
 
 
+def build_conversation_retriever(
+    tenant_id: str,
+    conversation_id: str,
+    full_rebuild: bool = True,
+    progress_callback=None,
+) -> Optional[HybridRetriever]:
+    """
+    按"企业+对话"构建独立检索器（对话级隔离核心）
+    读 rag/knowledge/<tenant_id>/<conversation_id>/ 下文档，写入 Milvus collection
+    agent03_<tenant_id>_<conversation_id>，并构建该对话内存BM25索引。
+    同企业下不同对话的知识库完全独立、绝不跨对话；企业级旧接口仍由 build_tenant_retriever 负责。
+    :param tenant_id: 企业/租户唯一标识
+    :param conversation_id: 对话唯一标识(自动生成)，用于知识库目录与collection命名
+    :param full_rebuild: True=删除旧collection全量重建；False=复用已有collection(有向量则跳过写入)
+    :param progress_callback: 可选进度回调(progress:int 0-100, message:str)
+    :return: HybridRetriever实例（需注册到 TenantRetrieverRegistry）；失败返回None
+    """
+    def _report(p: int, m: str):
+        if progress_callback:
+            try:
+                progress_callback(p, m)
+            except Exception:
+                pass
+
+    try:
+        conversation_key = f"{tenant_id}::{conversation_id}"
+        # 对话专属知识库目录 rag/knowledge/<tenant_id>/<conversation_id>/（文件层按对话隔离）
+        knowledge_dir = KNOWLEDGE_FOLDER / tenant_id / conversation_id
+        _report(5, "开始读取对话知识库文档")
+        raw_docs = load_knowledge_docs(knowledge_dir)
+        if len(raw_docs) == 0:
+            _report(100, "该对话暂无知识库文档")
+            print(f"[构建终止]对话 {conversation_key} 无知识库文档")
+            return None
+
+        _report(15, "文档切分中")
+        split_docs = split_documents(raw_docs)
+        print(f"[对话切分完成] conv={conversation_key}，文本块数量：{len(split_docs)}")
+        _report(25, f"切分完成，共 {len(split_docs)} 个文本块")
+
+        # 对话级 Milvus collection：agent03_<tenant_id>_<conversation_id>（向量层按对话隔离）
+        collection = f"agent03_{tenant_id}_{conversation_id}"
+        print(f"[Milvus] 对话 {conversation_key} collection:", collection)
+        _report(35, "正在加载向量模型并连接 Milvus")
+        retriever = HybridRetriever(collection_name=collection)
+        retriever.load_embedding(drop_old=full_rebuild)
+
+        existing_count = get_milvus_row_count(collection)
+        if full_rebuild or existing_count == 0:
+            # 分批写入，便于进度条反馈（每批约 20%，从 35% 推进到 85%）
+            batch_size = 50
+            total = len(split_docs)
+            for i in range(0, total, batch_size):
+                batch = split_docs[i : i + batch_size]
+                retriever.vector_store.add_documents(batch)
+                done = min(i + batch_size, total)
+                pct = 35 + int(50 * done / total)
+                _report(pct, f"向量入库 {done}/{total}")
+                print(f"[向量写入] conv={conversation_key} 已写入 {done}/{total} 块")
+        else:
+            print(f"[向量库跳过写入] conv={conversation_key} 已存在 {existing_count} 条向量")
+
+        _report(90, "构建关键词索引")
+        retriever.build_bm25_index(split_docs)
+        print(f"[BM25内存索引构建完成] conv={conversation_key}")
+        _report(100, "构建完成")
+        return retriever
+
+    except Exception as e:
+        print(f"[构建对话知识库异常] conv={tenant_id}::{conversation_id}, err={str(e)}")
+        import traceback
+        traceback.print_exc()
+        _report(100, f"构建失败：{str(e)}")
+        return None
+
+
 # ===================== 内嵌自测代码 =====================
 if __name__ == "__main__":
     print("==== build_vector_db 脚本自测 ====")

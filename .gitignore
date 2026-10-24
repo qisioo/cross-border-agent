@@ -14,3 +14,9 @@ wheels/
 
 # Vector DB (runtime-generated, do not commit)
 rag/chroma_db/
+
+# Runtime knowledge dirs (per-tenant/per-conversation, do not commit)
+rag/knowledge/*/
+
+# Runtime logs
+*.log

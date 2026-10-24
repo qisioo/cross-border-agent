@@ -366,19 +366,21 @@ def need_knowledge_judge_node(state: GraphState):
 def do_retrieve_node(state: GraphState, tenant_registry):
     """
     知识库检索节点：仅need_retrieve=True才会进入
-    按 state.tenant_id 从租户注册表取对应企业的检索器，调用混合RAG召回文档存入retrieved_chunks
-    该企业未构建知识库时返回空检索（纯隔离，不继承任何公共库）
+    按"企业+对话"(tenant_id + conversation_id) 从注册表取本对话的检索器，调用混合RAG召回文档存入retrieved_chunks
+    对话级隔离：检索只查本对话绑定的知识库，绝不跨对话；该对话未构建知识库时返回空检索（纯隔离）
     """
     agent = state["agent_state"]
     trace_id = agent.trace_id
     tenant_id = agent.tenant_id
+    conversation_id = agent.conversation_id
     # 改为使用LLM改写后的query进行检索
     rewrite_query = agent.rewritten_query
-    retriever = tenant_registry.get(tenant_id)
+    # get_for：conversation_id 非空则只取本对话检索器 key=tenant::conv，空则取企业级 key=tenant（兼容旧接口）
+    retriever = tenant_registry.get_for(tenant_id, conversation_id)
     if retriever is None:
-        print(f"[do_retrieve_node][trace_id={trace_id}] 租户 {tenant_id} 未构建企业知识库，返回空检索")
+        print(f"[do_retrieve_node][trace_id={trace_id}] 对话 {tenant_id}::{conversation_id} 未构建知识库，返回空检索（不跨对话）")
         return update_agent_state(state, retrieved_chunks=[])
-    print(f"[do_retrieve_node][trace_id={trace_id}] 租户 {tenant_id} 执行企业知识库混合检索，改写后query={rewrite_query}")
+    print(f"[do_retrieve_node][trace_id={trace_id}] 对话 {tenant_id}::{conversation_id} 执行知识库混合检索，改写后query={rewrite_query}")
 
     docs = retriever.hybrid_search(rewrite_query, top_k=8)
     new_state = update_agent_state(

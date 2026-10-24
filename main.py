@@ -20,6 +20,14 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 from agent.graph_builder import build_graph
 from rag.tenant_registry import get_tenant_registry
+# ==========【对话级隔离】企业主ID下多对话管理：对话元数据增删改查（conversations.json） ==========
+from rag.conversation_store import (
+    list_conversations,
+    create_conversation,
+    rename_conversation,
+    delete_conversation,
+    get_conversation,
+)
 from utils.helper import generate_trace_id
 # 全局agent graph实例
 agent_graph = None
@@ -110,11 +118,242 @@ async def get_build_progress(task_id: str):
         raise HTTPException(status_code=404, detail="构建任务不存在")
     return task
 
+# ==========【对话级隔离：企业主ID下的多对话管理 + 对话内知识库增删改查】==========
+# 结构：企业(tenant_id) → 多个对话(conversation) → 每对话独立知识库(文件/向量/检索三层隔离，绝不跨对话)
+def _validate_tenant(tenant_id: str) -> str:
+    """校验企业id：只允许字母/数字/下划线/连字符，长度1-64（用于Milvus collection与目录命名）"""
+    import re
+    tid = (tenant_id or "").strip()
+    if not tid:
+        raise HTTPException(status_code=400, detail="tenant_id不能为空")
+    if not re.match(r"^[A-Za-z0-9_\-]{1,64}$", tid):
+        raise HTTPException(status_code=400, detail="tenant_id只能包含字母/数字/下划线/连字符，长度1-64")
+    return tid
+
+
+def _validate_conversation_id(conversation_id: str) -> str:
+    """校验对话id：只允许字母/数字（uuid hex），长度1-64"""
+    import re
+    cid = (conversation_id or "").strip()
+    if not cid:
+        raise HTTPException(status_code=400, detail="conversation_id不能为空")
+    if not re.match(r"^[A-Za-z0-9]{1,64}$", cid):
+        raise HTTPException(status_code=400, detail="conversation_id只能包含字母/数字，长度1-64")
+    return cid
+
+
+class ConversationCreate(BaseModel):
+    name: Optional[str] = None
+
+
+class ConversationRename(BaseModel):
+    name: str = ""
+
+
+@app.post("/api/tenant/{tenant_id}/conversations")
+async def create_conversation_api(tenant_id: str, body: ConversationCreate):
+    """创建对话：企业主ID下新增一个对话，id自动生成，name可指定(默认"对话N")，并创建对话专属知识库目录"""
+    tid = _validate_tenant(tenant_id)
+    conv = create_conversation(tid, body.name or "")
+    print(f"[create_conversation] 企业 {tid} 新建对话: {conv}")
+    return {"code": 0, "data": conv}
+
+
+@app.get("/api/tenant/{tenant_id}/conversations")
+async def list_conversations_api(tenant_id: str):
+    """列出某企业全部对话（不跨对话）"""
+    tid = _validate_tenant(tenant_id)
+    return {"code": 0, "data": list_conversations(tid)}
+
+
+@app.put("/api/tenant/{tenant_id}/conversations/{conversation_id}")
+async def rename_conversation_api(tenant_id: str, conversation_id: str, body: ConversationRename):
+    """改对话显示名（id不变，知识库不变）"""
+    tid = _validate_tenant(tenant_id)
+    cid = _validate_conversation_id(conversation_id)
+    conv = rename_conversation(tid, cid, body.name or "")
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    return {"code": 0, "data": conv}
+
+
+@app.delete("/api/tenant/{tenant_id}/conversations/{conversation_id}")
+async def delete_conversation_api(tenant_id: str, conversation_id: str):
+    """删除对话：清对话元数据 + 知识库文件目录 + Milvus向量库 + 注册表，彻底隔离清理"""
+    tid = _validate_tenant(tenant_id)
+    cid = _validate_conversation_id(conversation_id)
+    ok = delete_conversation(tid, cid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    # 清理对话知识库文件目录
+    import shutil
+    conv_dir = Path("rag/knowledge") / tid / cid
+    if conv_dir.exists():
+        shutil.rmtree(conv_dir, ignore_errors=True)
+    # 清理注册表与Milvus向量库
+    registry = get_tenant_registry()
+    registry.remove(f"{tid}::{cid}")
+    try:
+        from pymilvus import MilvusClient
+        client = MilvusClient(uri="http://127.0.0.1:19530")
+        coll = f"agent03_{tid}_{cid}"
+        if client.has_collection(coll):
+            client.drop_collection(coll)
+    except Exception as e:
+        print(f"[delete_conversation] Milvus清理异常(可忽略): {e}")
+    print(f"[delete_conversation] 已删除企业 {tid} 对话 {cid}")
+    return {"code": 0, "msg": "对话已删除", "conversation_id": cid}
+
+
+@app.get("/api/tenant/{tenant_id}/conversations/{conversation_id}")
+async def conversation_detail_api(tenant_id: str, conversation_id: str):
+    """对话详情：元数据 + 知识库文件列表 + 构建状态"""
+    tid = _validate_tenant(tenant_id)
+    cid = _validate_conversation_id(conversation_id)
+    conv = get_conversation(tid, cid)
+    if conv is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    conv_dir = Path("rag/knowledge") / tid / cid
+    files = []
+    if conv_dir.exists():
+        for fp in sorted(conv_dir.glob("*")):
+            if fp.is_file():
+                files.append({"name": fp.name, "size": fp.stat().st_size})
+    from rag.hybrid_retriever import get_milvus_row_count
+    retriever = get_tenant_registry().get_for(tid, cid)
+    built = retriever is not None
+    row_count = 0
+    if built:
+        try:
+            row_count = get_milvus_row_count(f"agent03_{tid}_{cid}")
+        except Exception:
+            row_count = 0
+    data = dict(conv)
+    data["knowledge"] = files
+    data["built"] = built
+    data["chunk_count"] = row_count
+    return {"code": 0, "data": data}
+
+
+# 对话级知识库构建（复用 BUILD_TASKS 进度机制，加 conversation_id 标识）
+def _run_conversation_build(task_id: str, tenant_id: str, conversation_id: str):
+    """后台构建对话知识库并注册到注册表(键 tenant::conv)；进度写入BUILD_TASKS供进度接口轮询"""
+    from rag.build_vector_db import build_conversation_retriever
+
+    def _cb(p, m):
+        BUILD_TASKS[task_id]["progress"] = p
+        BUILD_TASKS[task_id]["message"] = m
+
+    BUILD_TASKS[task_id]["status"] = "running"
+    retriever = build_conversation_retriever(tenant_id, conversation_id, full_rebuild=True, progress_callback=_cb)
+    if retriever is None:
+        BUILD_TASKS[task_id].update({"status": "failed", "progress": 100, "message": "构建失败，请检查文档内容"})
+    else:
+        get_tenant_registry().register(f"{tenant_id}::{conversation_id}", retriever)
+        BUILD_TASKS[task_id].update({"status": "done", "progress": 100, "message": "构建完成"})
+
+
+@app.post("/api/tenant/{tenant_id}/conversations/{conversation_id}/upload")
+async def upload_conversation_knowledge(tenant_id: str, conversation_id: str, file: UploadFile = File(...)):
+    """上传对话知识库文档，异步构建该对话独立向量库(agent03_<tenant>_<conv>)，返回task_id供进度查询"""
+    tid = _validate_tenant(tenant_id)
+    cid = _validate_conversation_id(conversation_id)
+    if get_conversation(tid, cid) is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    filename = file.filename or "knowledge.txt"
+    if not (filename.lower().endswith((".txt", ".md", ".csv"))):
+        raise HTTPException(status_code=400, detail="仅支持 txt/md/csv 文档")
+
+    # 保存到该对话专属知识库目录 rag/knowledge/<tenant>/<conversation>/（文件层按对话隔离）
+    conv_dir = Path("rag/knowledge") / tid / cid
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(filename).name  # 防路径穿越
+    save_path = conv_dir / safe_name
+    content = await file.read()
+    save_path.write_bytes(content)
+    print(f"[upload_conversation_knowledge] 已保存对话 {tid}::{cid} 文档: {save_path}")
+
+    task_id = uuid.uuid4().hex
+    BUILD_TASKS[task_id] = {
+        "task_id": task_id, "tenant_id": tid, "conversation_id": cid,
+        "status": "running", "progress": 0, "message": "正在构建向量数据库...",
+    }
+    t = threading.Thread(target=_run_conversation_build, args=(task_id, tid, cid), daemon=True)
+    t.start()
+    return {"task_id": task_id, "tenant_id": tid, "conversation_id": cid, "status": "running", "message": "正在构建向量数据库..."}
+
+
+@app.get("/api/tenant/{tenant_id}/conversations/{conversation_id}/knowledge")
+async def list_conversation_knowledge(tenant_id: str, conversation_id: str):
+    """列出某对话知识库文件 + 构建状态（chunk数）"""
+    tid = _validate_tenant(tenant_id)
+    cid = _validate_conversation_id(conversation_id)
+    if get_conversation(tid, cid) is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    conv_dir = Path("rag/knowledge") / tid / cid
+    files = []
+    if conv_dir.exists():
+        for fp in sorted(conv_dir.glob("*")):
+            if fp.is_file():
+                files.append({"name": fp.name, "size": fp.stat().st_size})
+    from rag.hybrid_retriever import get_milvus_row_count
+    retriever = get_tenant_registry().get_for(tid, cid)
+    built = retriever is not None
+    row_count = 0
+    if built:
+        try:
+            row_count = get_milvus_row_count(f"agent03_{tid}_{cid}")
+        except Exception:
+            row_count = 0
+    return {"code": 0, "data": {"conversation_id": cid, "files": files, "built": built, "chunk_count": row_count}}
+
+
+@app.delete("/api/tenant/{tenant_id}/conversations/{conversation_id}/knowledge/{filename}")
+async def delete_conversation_knowledge_file(tenant_id: str, conversation_id: str, filename: str):
+    """删除对话下某个知识库文件，并触发该对话知识库重建"""
+    tid = _validate_tenant(tenant_id)
+    cid = _validate_conversation_id(conversation_id)
+    if get_conversation(tid, cid) is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    safe_name = Path(filename).name  # 防路径穿越
+    file_path = Path("rag/knowledge") / tid / cid / safe_name
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    file_path.unlink()
+    print(f"[delete_conversation_knowledge_file] 已删除对话 {tid}::{cid} 文件: {safe_name}，触发重建")
+    task_id = uuid.uuid4().hex
+    BUILD_TASKS[task_id] = {
+        "task_id": task_id, "tenant_id": tid, "conversation_id": cid,
+        "status": "running", "progress": 0, "message": "正在重建向量数据库...",
+    }
+    t = threading.Thread(target=_run_conversation_build, args=(task_id, tid, cid), daemon=True)
+    t.start()
+    return {"task_id": task_id, "conversation_id": cid, "status": "running", "message": "已删除文件，正在重建知识库"}
+
+
+@app.post("/api/tenant/{tenant_id}/conversations/{conversation_id}/rebuild")
+async def rebuild_conversation_knowledge(tenant_id: str, conversation_id: str):
+    """手动重建某对话知识库（重新索引现有全部文件）"""
+    tid = _validate_tenant(tenant_id)
+    cid = _validate_conversation_id(conversation_id)
+    if get_conversation(tid, cid) is None:
+        raise HTTPException(status_code=404, detail="对话不存在")
+    task_id = uuid.uuid4().hex
+    BUILD_TASKS[task_id] = {
+        "task_id": task_id, "tenant_id": tid, "conversation_id": cid,
+        "status": "running", "progress": 0, "message": "正在重建向量数据库...",
+    }
+    t = threading.Thread(target=_run_conversation_build, args=(task_id, tid, cid), daemon=True)
+    t.start()
+    return {"task_id": task_id, "conversation_id": cid, "status": "running", "message": "正在重建向量数据库"}
+
 # 请求体模型
 class AgentRequest(BaseModel):
     user_query: str
     session_id: Optional[str] = None
     tenant_id: str = "default"
+    conversation_id: Optional[str] = None
 
 # 配置常量
 MAX_QUERY_LENGTH = 800
@@ -148,8 +387,9 @@ async def agent_run(req: AgentRequest):
 
     session_id = req.session_id or "sess-default-001"
     tenant_id = (req.tenant_id or "default").strip() or "default"
-    # 多租户：thread_id 前缀租户id，隔离不同企业的对话历史/checkpoint
-    thread_id = f"{tenant_id}:{session_id}"
+    conversation_id = (req.conversation_id or "").strip() or ""
+    # 多租户 + 对话级隔离：thread_id 前缀企业id与对话id，隔离不同企业/不同对话的历史与checkpoint，绝不跨对话
+    thread_id = f"{tenant_id}:{conversation_id}:{session_id}" if conversation_id else f"{tenant_id}:{session_id}"
     config = {
         "configurable": {
             "thread_id": thread_id
@@ -173,6 +413,7 @@ async def agent_run(req: AgentRequest):
     clean_agent_state = AgentState(
         user_query=user_query,
         tenant_id=tenant_id,
+        conversation_id=conversation_id,
         original_input=user_query,
         product_raw_info=None,
         competitor_report="",
