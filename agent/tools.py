@@ -10,6 +10,9 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import os
+# ===== 统一从 .env 加载项目密钥（DEEPSEEK_API_KEY 等），并覆盖系统环境变量旧值 =====
+from dotenv import load_dotenv
+load_dotenv(override=True)
 import datetime
 
 # agent/tools.py 顶部增加

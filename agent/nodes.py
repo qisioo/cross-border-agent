@@ -1,5 +1,11 @@
 """ Agent全部业务节点集合 所有节点统一入参 state:GraphState，异常捕获，使用update_agent_state更新嵌套状态 禁止原地修改 agent_state 属性 """
 import json
+# ===== 统一从 .env 加载项目密钥（DEEPSEEK_API_KEY 等），并覆盖系统环境变量旧值 =====
+# 目的：无论从哪个入口进入（main.py / streamlit / 模块直接运行），都保证用 .env 的最新密钥，
+#       而不是可能残留的系统环境变量旧值（例如已废弃的 key）。
+import os
+from dotenv import load_dotenv
+load_dotenv(override=True)
 from typing import List, Literal,Any
 from langchain_core.messages import HumanMessage,AIMessage
 from langchain_deepseek import ChatDeepSeek
@@ -539,7 +545,35 @@ def exec_task_dispatcher(state: GraphState, tenant_registry):
                 print(f"[exec_task_dispatcher][trace_id={trace_id}] 纯对话任务，读取完整对话历史生成回答")
                 msg_history = state["messages"]
                 llm = ChatDeepSeek(model="deepseek-chat", temperature=0.7)
-                system_prompt = "你是跨境电商智能运营助手，根据对话历史自然回答用户，不要输出任何内部标记、子任务信息。"
+
+                # =====【新增：MCP 天气/时间能力，仅在日常对话中生效】=====
+                # 用 agent/mcp_tools.py 检测用户这句话是否需要天气/时间工具；
+                # 需要则通过 MCP（独立服务器 mcp_demo/server.py）拿到实时结果，
+                # 把结果塞给 LLM 让它自然回复。工具实现与 Agent 解耦，体现 MCP 复用。
+                tool_need = None
+                try:
+                    from agent.mcp_tools import detect_tool_need, get_weather, get_time
+                    tool_need = detect_tool_need(agent.user_query)
+                except Exception as mcp_e:
+                    print(f"[exec_task_dispatcher][trace_id={trace_id}] MCP检测异常: {mcp_e}")
+                    tool_need = None
+
+                if tool_need:
+                    tool_name = tool_need[0]
+                    tool_args = tool_need[1]
+                    if tool_name == "weather":
+                        tool_result = get_weather(tool_args.get("city", "武汉"))
+                    else:
+                        tool_result = get_time()
+                    print(f"[exec_task_dispatcher][trace_id={trace_id}] 已调用MCP工具 {tool_name}，结果={tool_result}")
+                    system_prompt = (
+                        "你是跨境电商智能运营助手。用户刚才问了天气/时间，"
+                        "以下是实时工具查询结果，请自然、简洁地回复用户（不要输出任何内部标记、子任务信息）：\n"
+                        f"{tool_result}"
+                    )
+                else:
+                    system_prompt = "你是跨境电商智能运营助手，根据对话历史自然回答用户，不要输出任何内部标记、子任务信息。"
+
                 resp = llm.invoke([{"role":"system","content":system_prompt}] + msg_history)
                 qa_result = {"answer": resp.content}
             else:
