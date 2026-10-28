@@ -87,9 +87,8 @@ def reciprocal_rank_fusion(
 
 
 class HybridRetriever:
-    def __init__(self, persist_directory: str = "./rag/chroma_db", collection_name: str = DEFAULT_COLLECTION):
+    def __init__(self, collection_name: str = DEFAULT_COLLECTION):
         self.embedding_func = None
-        self.persist_dir = persist_directory
         self.collection_name = collection_name
         self.vector_store: Optional[Milvus] = None
         self.bm25_retriever: Optional[BM25Retriever] = None
@@ -99,12 +98,14 @@ class HybridRetriever:
 
     def load_embedding(self, drop_old: bool = False):
         """延迟加载本地BGE‑M3 embedding模型并连接/创建 Milvus 向量库；drop_old=True 全量重建(删除旧collection)"""
+        print(f"[Embedding] 开始加载 BGE-M3 向量模型...")
         from langchain_huggingface import HuggingFaceEmbeddings
         self.embedding_func = HuggingFaceEmbeddings(
             model_name="BAAI/bge-m3",
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True}
         )
+        print(f"[Embedding] 向量模型加载完成，开始连接 Milvus...")
         # 连接本机Milvus；collection不存在自动创建，auto_id=True；drop_old=True删除旧collection重建
         self.vector_store = Milvus(
             embedding_function=self.embedding_func,
@@ -113,20 +114,23 @@ class HybridRetriever:
             auto_id=True,
             drop_old=drop_old,
         )
+        print(f"[Embedding] Milvus 连接成功，collection: {self.collection_name}")
 
     def load_reranker(self):
         """延迟加载官方BGE‑reranker‑v2‑m3，CPU运行"""
         if self.reranker is not None:
+            print("[Reranker] 重排序模型已加载，跳过")
             return
         try:
+            print("[Reranker] 开始加载 BGE-Reranker 重排序模型...")
             from FlagEmbedding import FlagReranker
             self.reranker = FlagReranker(
                 "BAAI/bge-reranker-v2-m3",
                 use_fp16=False
             )
-            print("[HybridRetriever] FlagReranker 重排序模型加载成功")
+            print("[Reranker] FlagReranker 重排序模型加载成功")
         except Exception as e:
-            print(f"[HybridRetriever] reranker加载失败: {str(e)}，跳过重排序，降级使用RRF+去重")
+            print(f"[Reranker] reranker加载失败: {str(e)}，跳过重排序，降级使用RRF+去重")
             self.reranker = None
 
     def build_bm25_index(self, docs: List[Document]) -> None:
@@ -139,7 +143,7 @@ class HybridRetriever:
             docs,
             preprocess_func=chinese_tokenizer
         )
-        self.bm25_retriever.k = 3
+        self.bm25_retriever.k = 5  # BM25召回数量，关键词精确匹配少而精
 
     def vector_search(self, query: str, top_k: int = 3) -> List[Document]:
         """向量相似度检索，增加异常捕获，出错返回空列表降级"""
@@ -176,35 +180,58 @@ class HybridRetriever:
         """
         混合检索主入口：RRF倒数排名融合两路召回结果 → 去重 → Rerank重排序过滤噪声
         :param query: 用户查询问句（已经过LLM改写后的rewritten_query）
-        :param top_k: 返回最终文档数量
+        :param top_k: 保底返回数量（得分没有明显断层时最少返回几个）
         :return: 重排序后Document列表
         """
-        # 1.两路召回，多拿候选给rerank做筛选
-        vec_docs = self.vector_search(query, top_k=top_k * 2)
+        print(f"[混合检索] 开始检索，query: {query[:50]}...")
+        # 1.两路召回，少而精，够用就行
+        vec_docs = self.vector_search(query, top_k=10)  # 向量召回10个候选
+        print(f"[混合检索] 向量召回数量: {len(vec_docs)}")
         key_docs = self.keyword_search(query)
+        print(f"[混合检索] BM25关键词召回数量: {len(key_docs)}")
 
         # 2.RRF融合打分
         scored_list = reciprocal_rank_fusion(vec_docs, key_docs)
         scored_list.sort(key=lambda x: x[0], reverse=True)
         fusion_docs = [item[1] for item in scored_list]
+        print(f"[混合检索] RRF融合后数量: {len(fusion_docs)}")
 
         # 3.去重
         fusion_docs = self._deduplicate_docs(fusion_docs)
+        print(f"[混合检索] 去重后数量: {len(fusion_docs)}")
         if len(fusion_docs) == 0:
+            print(f"[混合检索] 没有召回结果，返回空列表")
             return []
 
         # 4.重排序（如果模型加载成功）
         if self.reranker is not None:
+            print(f"[混合检索] 开始 Rerank 重排序...")
             score_input = [[query, doc.page_content] for doc in fusion_docs]
             rerank_scores = self.reranker.compute_score(score_input)
             scored_rerank = list(zip(rerank_scores, fusion_docs))
             # 过滤低分
             scored_rerank = [s for s in scored_rerank if s[0] >= self.rerank_threshold]
+            print(f"[混合检索] Rerank 过滤低分后数量: {len(scored_rerank)}（阈值: {self.rerank_threshold}）")
             scored_rerank.sort(key=lambda x: x[0], reverse=True)
-            final_docs = [doc for score, doc in scored_rerank[:top_k]]
+
+            # 动态top-n：根据得分断层选择，不是固定取前N个
+            # 遍历得分列表，找断崖式下跌的位置
+            gap_threshold = 0.15  # 相邻得分差超过这个值就算断层
+            dynamic_n = min(top_k, len(scored_rerank))  # 保底：最多取top_k个
+            for i in range(len(scored_rerank) - 1):
+                score_diff = scored_rerank[i][0] - scored_rerank[i + 1][0]
+                if score_diff >= gap_threshold:
+                    # 找到断层，断层之前的都保留
+                    dynamic_n = i + 1
+                    break
+            # 保底：最少取1个，最多不超过候选总数
+            dynamic_n = max(1, min(dynamic_n, len(scored_rerank)))
+            final_docs = [doc for score, doc in scored_rerank[:dynamic_n]]
+            print(f"[混合检索] 动态 top-n 最终数量: {len(final_docs)}")
         else:
             # rerank不可用，降级直接取RRF结果
             final_docs = fusion_docs[:top_k]
+            print(f"[混合检索] Reranker 未加载，降级返回前 {len(final_docs)} 个结果")
 
         return final_docs
 

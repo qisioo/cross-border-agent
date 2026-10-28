@@ -15,8 +15,6 @@ class AgentState(BaseModel):
     # ==========【对话级隔离】conversation_id：企业主ID下的一个对话，每个对话有独立知识库，对话间完全隔离 ==========
     conversation_id: str = Field(default="", description="对话唯一标识(自动生成)，同企业下多个对话彼此隔离，知识库按对话独立构建")
     original_input: str = Field(default="", description="商品链接/关键词/客服问题等原始输入")
-    rewritten_query: str = Field(default="",
-                                 description="经过LLM优化后的查询，用于RAG检索和知识库判断，user_query保留用户原始输入")
 
     # 商品全局复用数据（只抓取一次）
     product_raw_info: Optional[Dict[str, Any]] = Field(
@@ -34,27 +32,11 @@ class AgentState(BaseModel):
     customer_qa_result: Optional[Dict[str, Any]] = Field(default=None, description="客服回复结果")
     sales_data: Optional[Dict[str, Any]] = Field(default=None, description="销售数据查询结果")
 
-    # 任务调度控制
-    task_list: List[str] = Field(default_factory=list, description="LLM拆解出的子任务列表")
-    current_task_index: int = Field(default=0, description="当前执行的子任务索引")
-    current_task_type: str = Field(default="", description="当前任务类型：analysis/listing/customer_service/sales")
-    retry_count: int = Field(default=0, description="当前子任务重试计数")
-
-    # 异常与校验
-    error_msg: str = Field(default="", description="异常错误信息")
-    format_check_passed: bool = Field(default=False, description="输出格式校验是否通过")
-
     # 新增优化字段
     conversation_summary: str = Field(default="", description="长对话摘要，用于控制token消耗")
     trace_id: str = Field(default="", description="会话追踪ID，用于日志、链路排查")
 
-    # ==========【新增边界判断相关字段】==========
-    retrieved_chunks: Optional[Any] = Field(default=None, description="前置RAG召回的知识库文本块")
-    hit_boundary: bool = Field(default=False, description="是否命中知识库边界禁止规则")
-    boundary_answer: str = Field(default="", description="边界兜底回复文本")
-
-    # ==========【本次新增：知识检索判断 + 回答来源标记 + final_answer】==========
-    need_retrieve: bool = Field(default=False, description="LLM判定：是否需要检索电商私有知识库")
+    # ==========【本次新增：回答来源标记 + final_answer】==========
     answer_source: str = Field(default="", description="回答来源标记，可选：platform_knowledge / llm_knowledge")
     final_answer: str = Field(default="", description="Agent汇总后最终回答")
 
@@ -100,8 +82,6 @@ if __name__ == "__main__":
     print(f"初始 trace_id: {old_agent.trace_id}")
     print(f"初始 product_raw_info: {old_agent.product_raw_info}")
     print(f"初始 conversation_summary: {old_agent.conversation_summary}")
-    print(f"初始 retry_count: {old_agent.retry_count}")
-    print(f"初始 need_retrieve: {old_agent.need_retrieve}")
     print(f"初始 answer_source: {old_agent.answer_source}")
     print(f"初始 final_answer: {old_agent.final_answer}")
 
@@ -110,14 +90,12 @@ if __name__ == "__main__":
     new_agent = old_agent.model_copy(update={
         "product_raw_info": mock_product,
         "conversation_summary": "用户询问蓝牙耳机相关运营问题",
-        "need_retrieve": True,
         "answer_source": "platform_knowledge",
         "final_answer": "这里是最终回答测试文本"
     })
 
     print(f"\nmodel_copy之后 product_raw_info title: {new_agent.product_raw_info['title']}")
     print(f"model_copy之后 conversation_summary: {new_agent.conversation_summary}")
-    print(f"model_copy之后 need_retrieve: {new_agent.need_retrieve}")
     print(f"model_copy之后 answer_source: {new_agent.answer_source}")
     print(f"model_copy之后 final_answer: {new_agent.final_answer}")
 

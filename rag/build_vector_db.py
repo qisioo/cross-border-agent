@@ -1,5 +1,5 @@
 """ 向量库&BM25索引构建脚本
-1.加载rag/knowledge目录下 txt、md知识库文档
+1.加载rag/knowledge目录下 txt、md、pdf 知识库文档
 2.过滤空文档，文本切分
 3.Milvus向量库支持【全量重建(drop collection) / 增量追加】；默认全量重建，防止重复向量堆积
 4.构建Milvus向量库(agent03_<tenant_id>) + 内存BM25索引
@@ -10,6 +10,7 @@ import os
 # HF国内镜像，必须放在所有import huggingface相关库之前
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
+import hashlib
 import shutil
 import re
 from pathlib import Path
@@ -20,13 +21,112 @@ from rag.hybrid_retriever import HybridRetriever, DEFAULT_COLLECTION, get_milvus
 
 # 知识库文档目录
 KNOWLEDGE_FOLDER = Path(__file__).parent / "knowledge"
-# 【已废弃】旧Chroma向量库持久化目录；向量库已迁移Milvus，保留常量仅作兼容，不再创建该目录
-CHROMA_DB_FOLDER = Path(__file__).parent / "chroma_db"
+
+
+def _extract_pdf_text(file_path: Path) -> str:
+    """提取 PDF 文本 + 图片识别（Qwen-VL）"""
+    try:
+        import pdfplumber
+        text_parts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+
+        # 提取 PDF 里的图片，用 Qwen-VL 识别
+        image_text = _extract_pdf_images_with_qwen(file_path)
+        if image_text:
+            text_parts.append(image_text)
+
+        return "\n".join(text_parts)
+    except ImportError:
+        print(f"[警告] 未安装 pdfplumber，无法读取 PDF：{file_path.name}")
+        return ""
+    except Exception as e:
+        print(f"[PDF读取异常] {file_path.name}：{e}")
+        return ""
+
+
+def _extract_pdf_images_with_qwen(file_path: Path) -> str:
+    """用 PyMuPDF 提取 PDF 里的图片，再用 Qwen-VL 识别内容"""
+    try:
+        import fitz  # PyMuPDF
+        import dashscope
+        from dashscope import MultiModalConversation
+
+        # 从环境变量读取 API key
+        api_key = os.getenv("DASHSCOPE_API_KEY")
+        if not api_key:
+            print("[警告] 未配置 DASHSCOPE_API_KEY，跳过 PDF 图片识别")
+            return ""
+
+        dashscope.api_key = api_key
+        image_descriptions = []
+
+        doc = fitz.open(file_path)
+        img_count = 0
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            images = page.get_images(full=True)
+            for img_index, img in enumerate(images):
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                image_ext = base_image["ext"]
+
+                # 保存临时图片文件
+                temp_img_path = f"temp_pdf_img_{page_num}_{img_index}.{image_ext}"
+                with open(temp_img_path, "wb") as f:
+                    f.write(image_bytes)
+
+                # 调用 Qwen-VL 识别
+                try:
+                    messages = [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"image": f"file://{temp_img_path}"},
+                                {"text": "请提取这张图片中的所有文字信息和关键内容，按原文格式输出。如果是流程图或表格，请描述其结构和内容。"}
+                            ]
+                        }
+                    ]
+                    response = MultiModalConversation.call(model="qwen3.8-omni-flash", messages=messages)
+                    if response.status_code == 200:
+                        result_text = response.output.choices[0].message.content[0]["text"]
+                        image_descriptions.append(f"【PDF第{page_num+1}页图片{img_index+1}识别结果】\n{result_text}")
+                        img_count += 1
+                except Exception as e:
+                    print(f"[Qwen-VL识别异常] 第{page_num+1}页图片{img_index+1}：{e}")
+
+                # 删除临时图片文件
+                if os.path.exists(temp_img_path):
+                    os.remove(temp_img_path)
+
+        doc.close()
+        if img_count > 0:
+            print(f"[PDF图片识别] 共识别 {img_count} 张图片")
+        return "\n".join(image_descriptions)
+    except ImportError:
+        print("[警告] 未安装 PyMuPDF 或 dashscope，跳过 PDF 图片识别")
+        return ""
+    except Exception as e:
+        print(f"[PDF图片提取异常]：{e}")
+        return ""
+
+
+def _file_md5(file_path: Path) -> str:
+    """计算文件内容的 MD5 哈希，用于去重"""
+    md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            md5.update(chunk)
+    return md5.hexdigest()
 
 
 def load_knowledge_docs(knowledge_dir: Optional[Path] = None) -> List[Document]:
     """
-    读取指定知识库目录下全部 txt、md知识库文档（多租户：传 knowledge/<tenant_id>/ 即只读该企业文档）
+    读取指定知识库目录下全部 txt、md、pdf 知识库文档（多租户：传 knowledge/<tenant_id>/ 即只读该企业文档）
     过滤读取后空内容文档
     :param knowledge_dir: 目标目录，默认 KNOWLEDGE_FOLDER（rag/knowledge）
     :return: Document文档列表
@@ -35,28 +135,43 @@ def load_knowledge_docs(knowledge_dir: Optional[Path] = None) -> List[Document]:
     docs: List[Document] = []
     if not target.exists():
         target.mkdir(parents=True, exist_ok=True)
-        print(f"[警告]知识库目录 {target} 不存在，已自动创建，请放入txt/md FAQ文档")
+        print(f"[警告]知识库目录 {target} 不存在，已自动创建，请放入txt/md/pdf FAQ文档")
         return docs
 
     file_list = []
     file_list.extend(list(target.glob("*.txt")))
     file_list.extend(list(target.glob("*.md")))
+    file_list.extend(list(target.glob("*.pdf")))
 
     if len(file_list) == 0:
-        print("[警告] knowledge文件夹下没有txt/md知识库文件")
+        print("[警告] knowledge文件夹下没有txt/md/pdf知识库文件")
         return docs
 
+    # 哈希去重：相同内容的文件只处理一次
+    seen_md5 = set()
     print(f"[读取知识库] 一共找到 {len(file_list)} 个文档文件：")
     for file_path in file_list:
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
+            # 先算 MD5，相同内容跳过
+            file_md5 = _file_md5(file_path)
+            if file_md5 in seen_md5:
+                print(f"[跳过重复文件] {file_path.name}（内容与已读取文件相同）")
+                continue
+            seen_md5.add(file_md5)
+
+            # 根据文件后缀选择读取方式
+            if file_path.suffix.lower() == ".pdf":
+                content = _extract_pdf_text(file_path)
+            else:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+
             content = content.strip()
             if not content:
                 print(f"[跳过空文件] {file_path.name}")
                 continue
 
-            # ==========【强化文本清洗】新增逐行清除行尾空白字符，解决肉眼空行带空格问题 ==========
+            # ==========【强化文本清洗】逐行清除行尾空白字符 ==========
             lines = [line.rstrip() for line in content.splitlines()]
             content = "\n".join(lines)
             # 将带空格的伪空行统一转为标准双换行
@@ -66,7 +181,7 @@ def load_knowledge_docs(knowledge_dir: Optional[Path] = None) -> List[Document]:
 
             doc = Document(
                 page_content=content,
-                metadata={"source": file_path.name}
+                metadata={"source": file_path.name, "file_md5": file_md5}
             )
             docs.append(doc)
             print(f"✅ 成功读取文档：{file_path.name}，字符长度：{len(content)}")
@@ -80,12 +195,14 @@ def load_knowledge_docs(knowledge_dir: Optional[Path] = None) -> List[Document]:
 
 def split_documents(docs: List[Document]) -> List[Document]:
     """文档递归文本切分 + 文本去重【调优切分参数，降低RAG噪声】"""
+    print(f"[文档切分] 开始切分，原始文档数量：{len(docs)}")
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=220,         # 调小chunk，知识库FAQ更精准
         chunk_overlap=45,       # 重叠适度降低，减少重复片段
-        separators=["\n\n", "\n", "。", ". ", "，", ",", " "]
+        separators=["\n\n", "\n", "。", ". ", "！", "？", "；", ";", "，", ",", " "]
     )
     split_docs = splitter.split_documents(docs)
+    print(f"[文档切分] 切分完成，初始文本块数量：{len(split_docs)}")
     seen = set()
     valid_chunks = []
     for doc in split_docs:
@@ -93,6 +210,7 @@ def split_documents(docs: List[Document]) -> List[Document]:
         if content and content not in seen:
             seen.add(content)
             valid_chunks.append(doc)
+    print(f"[文档切分] 去重完成，有效文本块数量：{len(valid_chunks)}")
     return valid_chunks
 
 
@@ -187,6 +305,7 @@ def build_tenant_retriever(
         _report(35, "正在加载向量模型并连接 Milvus")
         retriever = HybridRetriever(collection_name=collection)
         retriever.load_embedding(drop_old=full_rebuild)
+        retriever.load_reranker()  # 加载重排序模型
 
         existing_count = get_milvus_row_count(collection)
         if full_rebuild or existing_count == 0:
@@ -263,6 +382,7 @@ def build_conversation_retriever(
         _report(35, "正在加载向量模型并连接 Milvus")
         retriever = HybridRetriever(collection_name=collection)
         retriever.load_embedding(drop_old=full_rebuild)
+        retriever.load_reranker()  # 加载重排序模型
 
         existing_count = get_milvus_row_count(collection)
         if full_rebuild or existing_count == 0:

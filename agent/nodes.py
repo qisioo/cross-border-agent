@@ -40,101 +40,6 @@ def _re_match_business(text: str) -> str:
         return "product_fetch"
     return "customer_service"
 
-def boundary_judge_node(state: GraphState):
-    """
-    LLM边界判断节点：读取前置RAG召回的chunk，判断是否命中边界规则
-    ✅规则更新：
-    1. 只有知识库原文明确标注【无法回答/超出能力】这类兜底语句，才触发拦截，直接返回boundary_answer
-    2. 知识库没有相关内容 → 不拦截，放行到task_parser_node，由LLM完成任务生成
-    ✅新增：同一会话追问（已有历史任务）直接放行，走完整任务编排
-    """
-    agent = state["agent_state"]
-    trace_id = agent.trace_id
-    query = agent.user_query
-    chunks = agent.retrieved_chunks
-    print(f"[boundary_judge_node][trace_id={trace_id}] 开始边界规则判断")
-
-    # ========== 方案A：硬关键词前置拦截【销量预测类】，优先执行 ==========
-    block_keywords = {"预测销量", "下月销量", "下个月销量", "预估销量"}
-    for kw in block_keywords:
-        if kw in query:
-            print(f"[boundary_judge_node][trace_id={trace_id}] 命中硬拦截关键词:{kw}")
-            return update_agent_state(
-                state,
-                hit_boundary=True,
-                boundary_answer="该问题超出当前知识库能力范围，请咨询运营专员。"
-            )
-
-    # ========== 新增：同一会话追问直接放行，走完整任务编排 ==========
-    if agent.task_list and agent.original_input and agent.original_input != query:
-        print(f"[boundary_judge_node][trace_id={trace_id}] 检测到同会话追问（历史任务列表非空），跳过知识库边界拦截，放行进入完整任务编排")
-        return update_agent_state(
-            state,
-            hit_boundary=False,
-            boundary_answer=""
-        )
-
-    # 拼接召回文本，兼容字符串 / LangChain Document 对象
-    if not chunks:
-        # 没有召回任何知识库内容，直接放行，交给LLM处理
-        print(f"[boundary_judge_node][trace_id={trace_id}] 召回文档为空，放行，由LLM原生知识生成回答")
-        return update_agent_state(state, hit_boundary=False, boundary_answer="")
-
-    chunk_text_list = []
-    for item in chunks:
-        if isinstance(item, str):
-            chunk_text_list.append(item)
-        elif isinstance(item, dict):
-            # checkpoint反序列化后，Document变成dict，读取page_content键
-            chunk_text_list.append(item.get("page_content", ""))
-        else:
-            # LangChain Document对象
-            chunk_text_list.append(item.page_content)
-    context = "\n".join(chunk_text_list)
-
-    # ========== 重写Prompt，修复之前逻辑缺陷 ==========
-    prompt = f"""你是边界规则判断器。
-任务：判断【参考知识库文本】是否存在明确的兜底声明，说明该类问题无法回答。
-用户问题：{query}
-参考知识库文本：{context}
-规则：
-1. 只有知识库原文明确写了【无法回答、超出能力范围，请咨询运营专员】这类兜底语句 → flag=true，reply摘抄知识库原文兜底语句。
-2. 知识库没有相关内容，或者知识库内容和问题无关，但**没有兜底声明** → flag=false，reply=""，放行，交给大模型处理。
-3. ⚠️重要：不能仅仅因为知识库里面没有对应答案，就拦截问题。
-4. reply字段只能摘抄知识库原文，禁止自己编造话术。
-5. 只输出标准JSON字符串，不要任何解释、前言、markdown、多余文字。
-
-输出示例1（命中边界）：
-{{"flag":true,"reply":"该问题超出当前知识库能力范围，请咨询运营专员。"}}
-
-输出示例2（正常可回答，放行）：
-{{"flag":false,"reply":""}}
-"""
-    hit_flag = False
-    reply_text = ""
-    max_retry = 2
-    for attempt in range(max_retry):
-        try:
-            llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
-            resp = llm.invoke(prompt)
-            raw_text = resp.content.strip()
-            data = safe_parse_json(raw_text, trace_id)
-            hit_flag = bool(data.get("flag", False))
-            reply_text = str(data.get("reply", ""))
-            break
-        except Exception as e:
-            print(f"[boundary_judge_node][trace_id={trace_id}] LLM边界判断 第{attempt+1}次解析异常：{str(e)}")
-            if attempt >= max_retry - 1:
-                # 重试耗尽，默认放行
-                hit_flag = False
-                reply_text = ""
-
-    return update_agent_state(
-        state,
-        hit_boundary=hit_flag,
-        boundary_answer=reply_text
-    )
-
 def intent_split_node(state: GraphState) -> dict[str, Any]:
     """
     【复合意图拆分节点 · 方案B(两层)：切分到原子粒度 + 分组标记 + 补全，不改动原有单意图逻辑】
@@ -302,9 +207,38 @@ def reflection_check_node(state: GraphState) -> dict[str, Any]:
                             _b = _re_match_business(text)
                             business = _b
                     new_items.append({"intent": text, "type": itype, "group_id": gid, "business": business})
-            if new_items and len(new_items) >= 1:
-                print(f"[reflection_check_node][trace_id={trace_id}] 反思校验通过/已修正，共 {len(new_items)} 个子意图")
-                return update_agent_state(state, intent_list=new_items, sub_results=[], sub_executed=False)
+            # ==========【新增：业务词规则兜底】LLM反思后，再用规则强制校验一次 ==========
+            # 原因：LLM在混合问题中容易漏判业务词，用规则兜底更稳
+            BUSINESS_WORDS = [
+                "退换货", "退货", "换货", "物流", "发货", "收货", "快递", "配送", "时效",
+                "售后", "客服", "热线", "邮箱", "投诉", "响应时间",
+                "优惠", "价格", "折扣", "满减", "包邮", "积分", "会员", "优惠券", "价保",
+                "仓库", "义乌", "天津", "华北仓", "华东仓",
+                "预售", "发货时间", "下单", "付款", "16:00",
+                "大件", "家具", "家电", "生鲜",
+                "商品", "产品", "订单", "购买", "签收"
+            ]
+            final_items = []
+            business_fixed = 0
+            for item in new_items:
+                text = item.get("intent", "")
+                # 检查是否包含业务词
+                has_business_word = any(word in text for word in BUSINESS_WORDS)
+                if has_business_word and item.get("type") != "knowledge":
+                    # 强制改成knowledge
+                    item["type"] = "knowledge"
+                    if not item.get("business"):
+                        item["business"] = "customer_service"
+                    business_fixed += 1
+                    print(f"[reflection_check_node][trace_id={trace_id}] 业务词兜底修正: '{text}' → knowledge")
+                final_items.append(item)
+            
+            if business_fixed > 0:
+                print(f"[reflection_check_node][trace_id={trace_id}] 业务词规则共修正 {business_fixed} 个子意图的类型")
+            
+            if final_items and len(final_items) >= 1:
+                print(f"[reflection_check_node][trace_id={trace_id}] 反思校验通过/已修正，共 {len(final_items)} 个子意图")
+                return update_agent_state(state, intent_list=final_items, sub_results=[], sub_executed=False)
     except Exception as e:
         print(f"[reflection_check_node][trace_id={trace_id}] 反思校验异常，保留原切分: {e}")
 
@@ -487,121 +421,6 @@ def exec_intent_node(state: GraphState, tenant_registry) -> dict[str, Any]:
         sub_executed=True
     )
 
-
-def task_parser_node(state: GraphState) -> dict[str, Any]:
-    """
-    LLM版本任务拆解节点
-    根据用户query自动识别业务类型，输出结构化子任务列表与task_type
-    使用safe_parse_json做LLM输出清洗与JSON校验
-    LangGraph节点：入参只有state，返回状态更新字典
-    """
-    agent = state["agent_state"]
-    trace_id = agent.trace_id
-    user_query = agent.user_query
-    print(f"[task_parser_node][trace_id={trace_id}] 用户query={user_query}, 开始LLM任务拆解")
-
-    prompt = """
-    你是任务拆解专家，请基于当前用户提问分析，输出严格JSON，禁止多余文字。可选业务类型： analysis：竞品分析；customer_service：知识库客服问答；listing：商品Listing文案生成；sales：销售数据查询；product_fetch：抓取商品网页信息。
-    输出格式：
-    {
-        "task_list": ["子任务1","子任务2"],
-        "current_task_type": "analysis|customer_service|listing|sales|product_fetch"
-    }
-    规则：
-    1. 用户询问商品FAQ、参数说明、商品概况、爆款情况、笼统销售表现，选customer_service，任务列表仅1项：["知识库检索并生成客服答案"]
-    2. 用户要求竞品对比、市场分析，选analysis，拆分成多步分析子任务
-    3. 用户需要商品标题、五点描述Listing文案，选listing
-    4. 用户查询CSV结构化销售数据选sales：**必须同时明确出现SKU/商品编号 AND 具体年月（例如2026‑08、2026年8月）两个要素；仅商品名称、只问销售情况、没有SKU编号或没有具体月份，禁止选sales，归customer_service**
-    5. 用户传入商品URL，要求抓取商品信息，选product_fetch，任务列表仅1项：["抓取商品网页信息"]
-    6. 用户纯闲聊、记忆类提问（例如记住名字、简单对话），选customer_service，任务列表仅1项：["对话问答，基于对话历史生成回答"]
-    """
-    # =====【修改】拆解任务只基于当前用户问题，不传完整对话历史=====
-    # 原因：历史中含上一轮超长业务报告会干扰拆解LLM，导致输出非JSON；对话记忆由"对话问答"任务阶段负责
-    msg_for_parse = [HumanMessage(content=user_query)]
-    llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
-    resp = llm.invoke([{"role": "system", "content": prompt}] + msg_for_parse)
-
-    raw_llm_output = resp.content
-
-    # 使用output_parsers解析，自动剥离markdown代码块
-    parse_result = safe_parse_json(raw_llm_output, trace_id)
-
-    if parse_result is None:
-        # JSON解析失败兜底，降级为客服任务
-        print(f"[task_parser_node][trace_id={trace_id}] LLM输出JSON解析失败，启用兜底客服任务")
-        task_list = ["知识库检索并生成客服答案"]
-        current_task_type = "customer_service"
-    else:
-        task_list = parse_result.get("task_list", ["知识库检索并生成客服答案"])
-        current_task_type = parse_result.get("current_task_type", "customer_service")
-
-    print(f"[task_parser_node][trace_id={trace_id}] 解析任务列表:{task_list}, task_type:{current_task_type}")
-    new_agent_state = agent.model_copy(update={
-        "task_list": task_list,
-        "current_task_type": current_task_type,
-        "current_task_index": 0,
-        "error_msg": "",
-        "retry_count": 0
-    })
-    return {"agent_state": new_agent_state}
-
-
-def query_rewrite_node(state: GraphState) -> dict[str, Any]:
-    """
-    Query改写节点：优化用户提问，提升RAG检索与意图判断准确率
-    规则：不改变用户原本诉求，补全模糊信息；闲聊短句不做改写
-    输出存入 agent_state.rewritten_query
-    """
-    agent = state["agent_state"].model_copy()
-    trace_id = agent.trace_id
-    raw_query = agent.user_query
-    print(f"[query_rewrite_node][trace_id={trace_id}] 原始query: {raw_query}")
-
-    llm = ChatDeepSeek(model="deepseek-chat", temperature=0.1)
-    prompt = """ 你是查询优化助手，任务：优化用户提问用于知识库检索。
-规则：
-1. 禁止修改、曲解用户的核心诉求，不能新增用户没有提到的信息；
-2. 用户提问模糊、简写、口语化，补全专业词汇，转为清晰、适合检索的书面问句；
-3. 闲聊短句（你好、谢谢、我是谁这类）直接原样返回，不要改写；
-4. 只输出改写后的问句，不要额外解释、不要markdown、不要多余文字。
-
-用户原始提问：{raw_query} """
-    resp = llm.invoke(prompt.format(raw_query=raw_query))
-    rewritten_query = resp.content.strip()
-    print(f"[query_rewrite_node][trace_id={trace_id}] 改写后query: {rewritten_query}")
-    #兜底，防止返回空字符串
-    if not rewritten_query:
-        rewritten_query = raw_query
-
-    # =========【缺失核心逻辑：把改写后的字段写入agent_state，生成新state返回】=========
-    new_state = update_agent_state(
-        state,
-        rewritten_query=rewritten_query
-    )
-    return new_state
-
-
-
-
-
-def increase_task_index(state: GraphState):
-    """
-    ✅统一任务下标自增工具，防止业务节点忘记index+1导致无限循环
-    封装为独立函数，所有exec任务执行完成后统一调用
-    任务成功推进时同步清空error_msg，避免上一次失败的错误残留导致误判
-    :param state:
-    :return: update_agent_state返回值，直接作为节点返回一部分
-    """
-    agent = state["agent_state"]
-    new_idx = agent.current_task_index + 1
-    trace_id = agent.trace_id
-    print(f"[increase_task_index][trace_id={trace_id}] 任务下标推进 {agent.current_task_index} → {new_idx}")
-    return update_agent_state(
-        state,
-        current_task_index=new_idx,
-        retry_count=0,
-        error_msg=""
-    )
 
 
 def task_router(state: GraphState) -> Literal["exec_task", "end"]:
@@ -997,17 +816,6 @@ def result_collect_node(state: GraphState):
     agent = state["agent_state"].model_copy()
     trace_id = agent.trace_id
     print(f"[result_collect_node][trace_id={trace_id}] 汇总全部业务结果")
-    raw_source_data = None
-    final_output = {}
-
-    if agent.answer_source == "platform_knowledge":
-        source_label = "【基于电商平台知识库回答】"
-    else:
-        source_label = "【大模型原生知识回答】"
-
-    # ========== 核心改动：按任务类型，只选取当前任务的原始素材，不拼接全部内容 ==========
-    task_type = agent.current_task_type
-
     # ==========【复合意图统一规划：sub_results非空时，按 group_id 分组，同组子意图结果一起做衔接推理】==========
     if agent.sub_executed and agent.sub_results:
         print(f"[result_collect_node][trace_id={trace_id}] 复合意图统一规划，共 {len(agent.sub_results)} 个子结果，开始按组聚合")
@@ -1083,58 +891,10 @@ def result_collect_node(state: GraphState):
         updated_state_dict["messages"] = [new_ai_msg]
         return updated_state_dict
 
-    if agent.hit_boundary and agent.boundary_answer and agent.boundary_answer.strip():
-        raw_source_data = agent.boundary_answer
-        final_output["boundary_answer"] = agent.boundary_answer
-    elif task_type == "product_fetch":
-        raw_source_data = agent.product_raw_info
-        final_output["product_raw_info"] = agent.product_raw_info
-    elif task_type == "listing":
-        raw_source_data = agent.listing_content
-        final_output["listing_content"] = agent.listing_content
-    elif task_type == "analysis":
-        raw_source_data = agent.competitor_report
-        final_output["competitor_report"] = agent.competitor_report
-    elif task_type == "sales":
-        raw_source_data = agent.sales_data
-        final_output["sales_data"] = agent.sales_data
-    elif task_type == "customer_service":
-        raw_source_data = agent.customer_qa_result
-        final_output["customer_qa"] = agent.customer_qa_result
-    else:
-        raw_source_data = None
-
-    # 兜底：素材为空/空字符串/空字典，直接返回兜底文案，绝不送入LLM
-    if not raw_source_data or (isinstance(raw_source_data, dict) and len(raw_source_data) == 0):
-        final_answer = "暂时没有找到相关信息。"
-        print(f"[result_collect_node][trace_id={trace_id}] 无参考素材，使用兜底回答")
-    else:
-        # ==========【Skill规则注入】润色固定约束下沉到skill/rules/result_collect.md，Skill结果优先，失败走既有兜底 ==========
-        from utils.skill_loader import get_skill_loader
-        # ======================================================================
-        user_prompt = f"""当前任务类型：{task_type} 【原始素材】 {raw_source_data} 请基于上面这份原始素材，润色排版，输出面向用户的最终回答。"""
-        try:
-            result_collect_rule = get_skill_loader().load_rule("result_collect")
-            if not result_collect_rule:
-                raise Exception("结果汇总润色规则加载失败（skill/rules/result_collect.md缺失）")
-            llm = ChatDeepSeek(model="deepseek-chat", temperature=0.3)
-            resp = llm.invoke([
-                {"role": "system", "content": result_collect_rule},
-                {"role": "user", "content": user_prompt}
-            ])
-            final_answer = resp.content.strip()
-            print(f"[result_collect_node][trace_id={trace_id}] LLM整理后的结果：\n{final_answer}")
-        except Exception as e:
-            print(f"[result_collect_node][trace_id={trace_id}] LLM文本整理异常: {str(e)}")
-            # LLM调用失败或规则缺失兜底，直接原始素材输出，防止链路崩溃
-            final_answer = str(raw_source_data)
-
-    # 更新agent_state内部字段final_answer
-    updated_state_dict = update_agent_state(
-        state,
-        final_answer=final_answer
-    )
-    # 只返回新增AIMessage，让add_messages reducer自动追加，不要返回完整列表
+    # 兜底：sub_results为空时，直接返回用户原始问题的简单回答
+    final_answer = "抱歉，我没有理解您的问题，请您换个方式问一下。"
+    print(f"[result_collect_node][trace_id={trace_id}] sub_results为空，使用兜底回答")
+    updated_state_dict = update_agent_state(state, final_answer=final_answer)
     new_ai_msg = AIMessage(content=final_answer)
     updated_state_dict["messages"] = [new_ai_msg]
     return updated_state_dict

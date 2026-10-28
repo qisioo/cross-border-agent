@@ -71,8 +71,8 @@ async def upload_tenant_knowledge(tenant_id: str = Form(...), file: UploadFile =
         raise HTTPException(status_code=400, detail="tenant_id只能包含字母/数字/下划线/连字符，长度1-64")
 
     filename = file.filename or "knowledge.txt"
-    if not (filename.lower().endswith((".txt", ".md", ".csv"))):
-        raise HTTPException(status_code=400, detail="仅支持 txt/md/csv 文档")
+    if not (filename.lower().endswith((".txt", ".md", ".csv", ".pdf"))):
+        raise HTTPException(status_code=400, detail="仅支持 txt/md/csv/pdf 文档")
 
     # 保存到该企业专属知识库目录 rag/knowledge/<tenant_id>/（文件层隔离）
     tenant_dir = Path("rag/knowledge") / tid
@@ -281,8 +281,8 @@ async def upload_conversation_knowledge(tenant_id: str, conversation_id: str, fi
         raise HTTPException(status_code=404, detail="对话不存在")
 
     filename = file.filename or "knowledge.txt"
-    if not (filename.lower().endswith((".txt", ".md", ".csv"))):
-        raise HTTPException(status_code=400, detail="仅支持 txt/md/csv 文档")
+    if not (filename.lower().endswith((".txt", ".md", ".csv", ".pdf"))):
+        raise HTTPException(status_code=400, detail="仅支持 txt/md/csv/pdf 文档")
 
     # 保存到该对话专属知识库目录 rag/knowledge/<tenant>/<conversation>/（文件层按对话隔离）
     conv_dir = Path("rag/knowledge") / tid / cid

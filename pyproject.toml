@@ -29,6 +29,7 @@ dependencies = [
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
 
 [dependency-groups]
 dev = [
@@ -36,5 +37,4 @@ dev = [
 ]
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
-default = true
 
