@@ -415,17 +415,11 @@ async def agent_run(req: AgentRequest):
         }
     }
 
-    # ==========【读取历史对话消息，丢弃历史任务状态 ==========
-    try:
-        saved_state = await agent_graph.get_state(config)
-
-        history_messages = saved_state.values.get("messages", [])
-    except Exception:
-        history_messages = []
-    new_messages = history_messages + [HumanMessage(content=user_query)]
-
+    # ==========【LangGraph checkpoint 自动恢复历史 messages，只需传新消息】 ==========
+    # 注意：不要手动拼 history_messages + 新消息，因为 add_messages reducer 会把
+    # 传入的无 id 历史消息全部当作新消息重复追加，导致历史错乱。
     payload = {
-        "messages": new_messages
+        "messages": [HumanMessage(content=user_query)]
     }
     # ==========【新增核心修复：每次请求前置重置checkpoint里的agent_state】 ==========
     from agent.state import AgentState
@@ -519,13 +513,8 @@ async def _execute_agent(req: AgentRequest) -> str:
     thread_id = f"{tenant_id}:{conversation_id}:{session_id}" if conversation_id else f"{tenant_id}:{session_id}"
     config = {"configurable": {"thread_id": thread_id}}
 
-    try:
-        saved_state = await agent_graph.get_state(config)
-        history_messages = saved_state.values.get("messages", [])
-    except Exception:
-        history_messages = []
-    new_messages = history_messages + [HumanMessage(content=user_query)]
-    payload = {"messages": new_messages}
+    # LangGraph checkpoint 自动恢复历史 messages，只需传新消息
+    payload = {"messages": [HumanMessage(content=user_query)]}
 
     # 前置重置 checkpoint 里的 agent_state（与 /api/agent/run 一致）
     from agent.state import AgentState

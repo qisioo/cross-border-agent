@@ -22,8 +22,12 @@ if "tenant_id" not in st.session_state:
     st.session_state.tenant_id = "default"
 if "current_conversation_id" not in st.session_state:
     st.session_state.current_conversation_id = None
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# 按conversation_id分别缓存聊天记录，切换对话不丢失
+if "messages_by_conv" not in st.session_state:
+    st.session_state.messages_by_conv = {}
+# 当前对话的messages引用，方便读取
+_conv_id = st.session_state.get("current_conversation_id")
+st.session_state.messages = st.session_state.messages_by_conv.get(_conv_id, [])
 
 # ========== 侧边栏：企业管理 + 对话管理 + 当前对话知识库 ==========
 with st.sidebar:
@@ -36,6 +40,7 @@ with st.sidebar:
         st.session_state.tenant_id = tenant_id
         st.session_state.current_conversation_id = None
         st.session_state.messages = []
+        st.session_state.messages_by_conv = {}
     st.session_state.tenant_id = tenant_id
 
     st.divider()
@@ -49,8 +54,13 @@ with st.sidebar:
             r = requests.post(f"{API_BASE}/api/tenant/{tenant_id}/conversations", json=body, timeout=15)
             if r.status_code == 200:
                 conv = r.json()["data"]
+                # 存回旧对话messages
+                old_id = st.session_state.current_conversation_id
+                if old_id:
+                    st.session_state.messages_by_conv[old_id] = st.session_state.messages
                 st.session_state.current_conversation_id = conv["id"]
                 st.session_state.messages = []
+                st.session_state.messages_by_conv[conv["id"]] = []
                 st.success(f"已创建对话：{conv['name']}（{conv['id']}）")
                 st.rerun()
             else:
@@ -65,18 +75,24 @@ with st.sidebar:
     except Exception:
         convs = []
     if convs:
-        options = [f"{c['name']}（{c['id']}）" for c in convs]
+        options = [f"{c['name']}（{c['id'][:8]}）" for c in convs]
         cur_idx = 0
         if st.session_state.current_conversation_id:
             for i, c in enumerate(convs):
                 if c["id"] == st.session_state.current_conversation_id:
                     cur_idx = i
                     break
-        sel = st.selectbox("选择对话", options, index=cur_idx, key="conv_select")
+        sel = st.selectbox("选择对话", options, index=cur_idx)
         sel_id = convs[options.index(sel)]["id"]
         if sel_id != st.session_state.current_conversation_id:
+            # 先把当前对话的messages存回缓存
+            old_id = st.session_state.current_conversation_id
+            if old_id:
+                st.session_state.messages_by_conv[old_id] = st.session_state.messages
+            # 切换到新对话
             st.session_state.current_conversation_id = sel_id
-            st.session_state.messages = []
+            st.session_state.messages = st.session_state.messages_by_conv.get(sel_id, [])
+            st.rerun()
 
         # 当前对话操作：改名 / 删除
         ctrl = st.radio("对话操作", ["无", "改名", "删除"], horizontal=True, key="conv_ctrl")
@@ -101,6 +117,9 @@ with st.sidebar:
                     r = requests.delete(
                         f"{API_BASE}/api/tenant/{tenant_id}/conversations/{sel_id}", timeout=15)
                     if r.status_code == 200:
+                        # 从缓存中删除该对话的messages
+                        if sel_id in st.session_state.messages_by_conv:
+                            del st.session_state.messages_by_conv[sel_id]
                         st.session_state.current_conversation_id = None
                         st.session_state.messages = []
                         st.success("对话已删除")
@@ -231,6 +250,7 @@ for m in st.session_state.messages:
 prompt = st.chat_input("请输入您的问题", disabled=(not conv_id))
 if prompt and conv_id:
     st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages_by_conv[conv_id] = st.session_state.messages
     with st.chat_message("user"):
         st.markdown(prompt)
     payload = {
@@ -247,6 +267,7 @@ if prompt and conv_id:
                     answer = data.get("final_answer") or data.get("msg") or "（无回答）"
                     st.markdown(answer)
                     st.session_state.messages.append({"role": "assistant", "content": answer})
+                    st.session_state.messages_by_conv[conv_id] = st.session_state.messages
                 else:
                     st.error(f"请求失败: {resp.text}")
             except Exception as e:

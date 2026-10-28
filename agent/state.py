@@ -58,6 +58,24 @@ class AgentState(BaseModel):
     answer_source: str = Field(default="", description="回答来源标记，可选：platform_knowledge / llm_knowledge")
     final_answer: str = Field(default="", description="Agent汇总后最终回答")
 
+    # ==========【复合意图拆分：支持"天气+商品+物流"等多意图问题】==========
+    # 用户问题可能包含多个独立子意图（如天气、商品推荐、物流），
+    # 先拆分成原子级子意图、同属一个上层问题的子意图打相同 group_id 分组标记、
+    # 再逐个子意图独立路由、最后按组聚合统一规划衔接推理。
+    intent_list: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="拆分后的原子子意图列表，每项形如 {'intent': 子意图原文, 'type': 意图类型(weather/knowledge/chat/...), 'group_id': 上层问题分组标记，同属一个问题则相同}"
+    )
+    sub_results: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="各子意图独立执行后的结果收集，每项形如 {'type': 意图类型, 'intent': 子意图, 'group_id': 分组标记, 'result': 执行结果}，按 group_id 分组后供统一规划使用"
+    )
+    sub_executed: bool = Field(default=False, description="标记子意图是否已全部执行，防止重复执行")
+
+    # ==========【输出反思：校验最终回答是否覆盖用户原始问题】==========
+    output_reflection_retry: int = Field(default=0, description="输出反思重试计数，最多重试1次防止死循环")
+    output_reflection_issues: str = Field(default="", description="输出反思发现的问题，用于重新整合时反馈给大模型")
+
 
 # 外层LangGraph真正使用的状态：继承MessagesState，messages放在顶层
 class GraphState(MessagesState):

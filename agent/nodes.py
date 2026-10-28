@@ -18,6 +18,28 @@ from agent.tools import product_info_fetch, competitor_analysis, listing_generat
 
 MAX_TASK_RETRY = 2  # 单个子任务最大重试次数
 
+
+def _re_match_business(text: str) -> str:
+    """
+    业务类型辅助判断（方案1内化旧 task_parser 的 business 判断）
+    仅对 knowledge 子意图生效，按文本关键词细分为：
+        sales(销量) / analysis(竞品) / listing / product_fetch(抓取) / customer_service(客服，默认)
+    """
+    import re as _re
+    _SALES_PAT = _re.compile(r"销量|销售数据|销售额|下月销量|SKU|库存|预测.*销量")
+    _ANALYSIS_PAT = _re.compile(r"竞品|分析|对比|市场")
+    _LISTING_PAT = _re.compile(r"listing|标题|五点|五点描述|描述|文案")
+    _FETCH_PAT = _re.compile(r"抓取|爬|商品链接|URL|商品网页")
+    if _SALES_PAT.search(text):
+        return "sales"
+    if _ANALYSIS_PAT.search(text):
+        return "analysis"
+    if _LISTING_PAT.search(text):
+        return "listing"
+    if _FETCH_PAT.search(text):
+        return "product_fetch"
+    return "customer_service"
+
 def boundary_judge_node(state: GraphState):
     """
     LLM边界判断节点：读取前置RAG召回的chunk，判断是否命中边界规则
@@ -112,6 +134,359 @@ def boundary_judge_node(state: GraphState):
         hit_boundary=hit_flag,
         boundary_answer=reply_text
     )
+
+def intent_split_node(state: GraphState) -> dict[str, Any]:
+    """
+    【复合意图拆分节点 · 方案B(两层)：切分到原子粒度 + 分组标记 + 补全，不改动原有单意图逻辑】
+    作用：把用户一整句话拆成多个"原子级"子意图，每个子意图单一诉求、单一来源，
+          对"同属一个上层问题"的子意图打相同 group_id，并结合原句补全省略语义。
+    例："武汉今天天气怎么样，给我推荐一个蓝牙耳机，如果我下单的话武汉的天气会不会影响物流运输，大概多少天能到"
+        → [
+            {"intent":"武汉今天天气怎么样","group":1,"type":"non_knowledge"},
+            {"intent":"给我推荐一个蓝牙耳机","group":2,"type":"knowledge"},
+            {"intent":"武汉今天的天气如何","group":1,"type":"non_knowledge"},   # 同属"天气是否影响物流"
+            {"intent":"大模型推荐的蓝牙耳机物流运输大概几天能到","group":1,"type":"knowledge"},  # 同组，已补全
+          ]
+    类型判断用"两层"（不用LLM判类型，更稳，也避免过度细分）：
+        knowledge      → 命中业务词（商品/物流/售后/销量等），需要读知识库
+        non_knowledge  → 其余全部（天气/时间/闲聊/通用知识），不读知识库；
+                         是否调MCP工具（天气/时间）由 exec_intent_node 内 detect_tool_need 决定
+    单意图或拆分失败时，intent_list 置空，走原有单意图逻辑。
+    """
+    agent = state["agent_state"]
+    trace_id = agent.trace_id
+    query = agent.user_query
+    print(f"[intent_split_node][trace_id={trace_id}] 开始复合意图拆分: {query}")
+
+    # 1. 用LLM把整句拆成"原子级子意图"+分组标记+结合原句补全省略
+    llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
+    prompt = """你是意图拆分器。任务：把用户一句话拆成多个"原子级"子意图，结合原句补全省略语义，并为同属一个上层问题的子意图打上相同分组编号。
+
+规则：
+1. 每个子意图必须单一诉求、单一来源、能从原话中直接对应，禁止改写、禁止新增、禁止删除关键信息。
+2. 切分到原子粒度：只要原话里隐含了多个可独立获取的信息诉求，就要拆成多个子意图。
+   例："天气会不会影响物流、大概几天能到" 隐含"查天气"和"查物流规则"两个诉求，要拆成两个子意图，但它们属于同一个上层问题，group编号相同。
+3. 组的概念：如果多个子意图最终要放在一起推理（例如"天气"+"物流规则"一起回答"天气是否影响物流"），它们必须用相同的group编号。
+   相互独立、不需要联合推理的子意图，用不同的group编号。
+4. 重要（补全省略）：子意图若存在省略，必须结合【用户原句】理解指代关系，补全为主语/宾语，使其能独立理解。
+   - 补全只能使用原句中已出现的对象，禁止凭空编造、禁止换对象。
+   - 例：原句是"给我推荐一个蓝牙耳机……物流大概多少天能到"，那么省略的"物流运输大概多少天能到"应补全为"【原句推荐的蓝牙耳机】物流运输大概多少天能到"，绝不能补成"牙刷"或"电脑"。
+   - 若子意图本身语义完整，无需补全，原样保留。
+5. 重要：不要把一句话里的"程度/时间碎片"（例如"大概多少天""多久能到""怎么样"）单独拆成一个子意图。这类碎片必须并入它所属的那个主诉求子意图，不要拆成独立的残缺子意图。
+6. group编号从1开始，用整数。
+7. 如果整句话是单一意图、单一来源，只输出1个子意图。
+8. 只输出严格JSON：{"intents": [{"intent": "子意图1", "group": 1}, {"intent": "子意图2", "group": 1}, ...]}，不要多余文字。
+
+用户原句（补全时必须参考它，理解指代关系）：__USER_QUERY__"""
+    try:
+        # 用replace注入query，避免prompt内JSON示例花括号与.format冲突
+        final_prompt = prompt.replace("__USER_QUERY__", query)
+        resp = llm.invoke(final_prompt)
+        data = safe_parse_json(resp.content.strip(), trace_id)
+        raw_intents = data.get("intents", [])
+        print(f"[intent_split_node][trace_id={trace_id}] LLM拆分原始返回: {resp.content[:300]}")
+    except Exception as e:
+        print(f"[intent_split_node][trace_id={trace_id}] 拆分异常，降级整句: {e}")
+        raw_intents = []
+
+    # 兼容两种返回：字符串列表（旧） / 带group的字典列表
+    intents = []
+    for it in raw_intents:
+        if isinstance(it, dict):
+            intents.append({"text": str(it.get("intent", "")).strip(), "group": int(it.get("group", 0))})
+        elif isinstance(it, str):
+            intents.append({"text": it.strip(), "group": 0})
+
+    # 统一链路：不区分单/多意图，全部构造为子意图列表（单意图就是1个），统一走 intent_execute
+    # 兜底：完全拆不出任何子意图时，把整句当作1个子意图，保证链路不中断
+    if not intents:
+        intents = [{"text": agent.user_query.strip(), "group": 1}]
+
+    # 2. 对每个子意图判断类型（两层：业务→knowledge，其余→non_knowledge）
+    # 不再细分 weather/chat——它们在"是否读知识库"上同属"不读"，是否调MCP工具由执行节点决定
+    # 方案1：knowledge 子意图额外标注 business 类型（sales/analysis/listing/product_fetch/customer_service），
+    #         供 exec_intent_node 按业务路由到具体工具，保证销量/竞品/listing/抓取能力全部保留。
+    import re as _re
+    _KNOWLEDGE_PAT = _re.compile(r"商品|耳机|物流|发货|运输|售后|退货|退款|客服|推荐|价格|优惠|活动|促销|满减|折扣|优惠券|包邮|积分|价保|运费|到货|配送|库存|销量|几天|多久|销售|查询|分析|listing|标题|五点|描述")
+    _TIME_PAT_EARLY = _re.compile(r"几点|什么时间|现在时间|当前时间|几点了|时区|几月几号|什么时候|几点钟|时间是多少|现在几点|此刻时间|日期|几号|星期几|周几")
+    intent_items = []
+    for it in intents:
+        text = it["text"]
+        if not text:
+            continue
+        # 时间/日期类问题优先走 non_knowledge，避免被"几天|多久"等业务词误命中
+        if _TIME_PAT_EARLY.search(text):
+            itype = "non_knowledge"
+            business = ""
+        elif _KNOWLEDGE_PAT.search(text):
+            itype = "knowledge"
+            # 内化旧 task_parser 的业务类型判断，标注具体业务（销量/竞品/listing/抓取/客服）
+            business = _re_match_business(text)
+        else:
+            itype = "non_knowledge"
+            business = ""
+        intent_items.append({"intent": text, "type": itype, "group_id": it["group"], "business": business})
+
+    print(f"[intent_split_node][trace_id={trace_id}] 统一拆分为 {len(intent_items)} 个子意图: {intent_items}")
+    return update_agent_state(state, intent_list=intent_items, sub_results=[], sub_executed=False)
+
+
+def reflection_check_node(state: GraphState) -> dict[str, Any]:
+    """
+    【反思校验节点 · 增量新增】
+    在意图切分后、逐意图执行前，让大模型审视切分结果是否正确：
+      1. 每个子意图是否都能在原句中找到对应（没编造）？
+      2. 补全部分是否曲解了原意、是否换成了原句没有的对象（没歪曲）？
+      3. 分组是否合理（同属一个上层问题的有没有归错组）？
+    有问题 → 返回修正后的 intent_list；没问题 → 原样保留。
+    反思失败时，保留原切分结果（不阻断链路），仅记录日志。
+    """
+    agent = state["agent_state"]
+    trace_id = agent.trace_id
+    if not agent.intent_list:
+        return update_agent_state(state, intent_list=agent.intent_list, sub_results=[], sub_executed=False)
+
+    original_query = agent.user_query
+    current_intents = agent.intent_list
+    print(f"[reflection_check_node][trace_id={trace_id}] 开始反思校验 {len(current_intents)} 个子意图")
+
+    llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
+    # 把当前切分结果序列化给LLM审视
+    current_json = json.dumps(
+        [{"intent": it["intent"], "group": it["group_id"], "type": it["type"]} for it in current_intents],
+        ensure_ascii=False
+    )
+    reflection_prompt = """你是意图切分评审员。任务：审视下面这份"切分结果"是否正确，若有问题则修正后返回，若无问题则原样返回。
+
+【用户原句】{orig}
+【当前切分结果】{current}
+
+检查三点：
+1. 是否编造：每个子意图是否都能在用户原句中找到对应内容？（不能用原句没有的对象）
+2. 是否曲解/换对象：补全部分是否把主语/宾语换成了原句没有的对象？（例如原句是"蓝牙耳机"，补全成"牙刷/电脑"就是错误）
+3. 分组是否合理：同属一个上层问题、需要联合推理的子意图，是否用了相同的group编号？相互独立的子意图是否用了不同编号？
+
+如果完全正确，原样返回。
+如果有问题，输出修正后的完整切分结果。
+
+只输出严格JSON：{"intents": [{"intent": "子意图1", "group": 1, "type": "knowledge|non_knowledge"}, ...]}，不要多余文字。
+不要删除有用的子意图，不要新增原句没有的诉求。"""
+    try:
+        final_prompt = reflection_prompt.replace("{orig}", original_query).replace("{current}", current_json)
+        resp = llm.invoke(final_prompt)
+        data = safe_parse_json(resp.content.strip(), trace_id)
+        raw_reflected = data.get("intents", [])
+        if raw_reflected:
+            # 重新构造意图列表（保留原有类型与分组，若LLM给出type则采用）
+            new_items = []
+            for it in raw_reflected:
+                if isinstance(it, dict):
+                    text = str(it.get("intent", "")).strip()
+                    gid = int(it.get("group", 0))
+                    itype = str(it.get("type", "")).strip()
+                    if not text:
+                        continue
+                    if itype not in ("knowledge", "non_knowledge"):
+                        # 兼容旧的 weather/time/chat 标记，统一映射到两层
+                        itype = "knowledge" if itype == "knowledge" else "non_knowledge"
+                    # 保留原 business 标注（切分时已推断；反思仅审视切分正确性，不重算业务类型）
+                    business = ""
+                    if itype == "knowledge":
+                        # 从原切分中找回 business
+                        for _orig in current_intents:
+                            if _orig.get("intent") == text:
+                                business = _orig.get("business", "")
+                                break
+                        if not business:
+                            # 找不到原business（反思改了文本），按当前文本快速重判
+                            _b = _re_match_business(text)
+                            business = _b
+                    new_items.append({"intent": text, "type": itype, "group_id": gid, "business": business})
+            if new_items and len(new_items) >= 1:
+                print(f"[reflection_check_node][trace_id={trace_id}] 反思校验通过/已修正，共 {len(new_items)} 个子意图")
+                return update_agent_state(state, intent_list=new_items, sub_results=[], sub_executed=False)
+    except Exception as e:
+        print(f"[reflection_check_node][trace_id={trace_id}] 反思校验异常，保留原切分: {e}")
+
+    # 兜底：反思失败，保留原切分结果
+    print(f"[reflection_check_node][trace_id={trace_id}] 反思校验未产出修正，保留原切分")
+    return update_agent_state(state, intent_list=agent.intent_list, sub_results=[], sub_executed=False)
+
+
+def route_after_split(state: GraphState) -> Literal["intent_execute"]:
+    """统一链路路由：所有意图（单/复合）统一走 intent_execute，由执行节点按 type/business 分发。
+    复合意图逐个子意图执行；单意图就是1个子意图，同样走统一执行。"""
+    agent = state["agent_state"]
+    print(f"[route_after_split][trace_id={agent.trace_id}] 统一链路，进入逐子意图执行（共{len(agent.intent_list) or 0}个）")
+    return "intent_execute"
+
+
+def exec_intent_node(state: GraphState, tenant_registry) -> dict[str, Any]:
+    """
+    【逐子意图执行节点 · 增量新增】
+    对 intent_list 里每个子意图独立执行：
+        weather/time → 调 MCP 工具取实时数据
+        knowledge    → 知识库检索 + 客服问答
+        chat         → 纯对话（LLM + 对话历史）
+    每个子意图的结果收集进 sub_results，最后统一交给 result_collect 衔接推理。
+    任一子意图失败：记录错误，不中断整条链路。
+    """
+    agent = state["agent_state"]
+    trace_id = agent.trace_id
+    results = []
+    print(f"[exec_intent_node][trace_id={trace_id}] 开始逐个执行 {len(agent.intent_list)} 个子意图")
+
+    from agent.mcp_tools import detect_tool_need, get_weather, get_time
+
+    for item in agent.intent_list:
+        itype = item.get("type")
+        intent = item.get("intent", "")
+        group_id = item.get("group_id", 0)
+        business = item.get("business", "")
+        try:
+            if itype == "knowledge":
+                # ========== 业务类：按 business 路由到具体业务工具（方案1内化旧 task_parser 能力） ==========
+                # 销量/竞品/listing/抓取/客服 全部保留，子意图独立执行，不依赖旧 task_parser/exec_task 链路
+                if business == "sales":
+                    # 销售数据查询：子意图文本已补全（如"查询SKU001在2026-09的销售数据"），直接交给sales_data_query
+                    sales_res = sales_data_query(user_query=intent, trace_id=trace_id)
+                    ans = sales_res.get("data", "") if not sales_res.get("error") else f"该子意图暂无法回答"
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[sales][组{group_id}] 销量查询: {intent} → {str(ans)[:80]}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": str(ans)})
+
+                elif business == "analysis":
+                    # 竞品分析：复用旧链路的并行分析能力（抓一次数据，并行LLM分析全部子任务）
+                    import concurrent.futures
+                    from agent.tools import competitor_analysis_parallel, fetch_product_list
+                    subtasks = [intent]  # 单个子意图即一个分析任务
+                    kw_llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
+                    kw_prompt = f"""你是关键词提取器，从用户的商品查询语句提取英文搜索关键词，仅输出关键词，不要多余文字。
+                用户原始查询：{intent}
+                要求：只输出适合books.toscrape图书网站搜索的英文关键词，如果是耳机/电子产品这类图书网站不存在的品类，直接返回 "none"
+                """
+                    kw_resp = kw_llm.invoke(kw_prompt)
+                    search_keyword = kw_resp.content.strip()
+                    if search_keyword.lower() == "none":
+                        list_url = ""
+                    else:
+                        import urllib.parse
+                        encoded_kw = urllib.parse.quote(search_keyword)
+                        list_url = f"https://books.toscrape.com/catalogue/search?query={encoded_kw}"
+                    batch_result = {}
+                    if list_url:
+                        batch_result = fetch_product_list(list_page_url=list_url, trace_id=trace_id, limit=3)
+                    else:
+                        batch_result = {"product_items": [], "warning_msg": "当前查询品类不在图书站点范围内，无商品可抓取"}
+                    product_items = batch_result.get("product_items", []) if "error" not in batch_result else []
+                    warning_msg = batch_result.get("warning_msg", "")
+                    if not product_items:
+                        report = competitor_analysis(product_name=intent, price_range="", trace_id=trace_id)
+                    else:
+                        def _run_analysis(_task):
+                            return competitor_analysis_parallel(_task, product_items, trace_id, warning_msg)
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            report_list = list(pool.map(_run_analysis, subtasks))
+                        report = "\n\n".join(report_list)
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[analysis][组{group_id}] 竞品分析: {intent} → {report[:80]}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": report})
+
+                elif business == "listing":
+                    # Listing文案生成：需要商品基础信息（从缓存取或要求提供链接）
+                    if agent.product_raw_info is not None:
+                        product_info = agent.product_raw_info
+                    else:
+                        # 无商品信息：交给客服问答兜底（提示需要商品资料），不抛异常阻断
+                        retriever = tenant_registry.get_for(agent.tenant_id, agent.conversation_id)
+                        docs = retriever.hybrid_search(intent, top_k=4) if retriever is not None else []
+                        qa = customer_service_qa(question=intent, retrieve_docs=docs, trace_id=trace_id)
+                        ans = qa.get("answer", "") if not qa.get("error") else f"该子意图暂无法回答"
+                        print(f"[exec_intent_node][trace_id={trace_id}] 子意图[listing][组{group_id}] 缺商品资料，回退客服: {intent} → {ans[:80]}")
+                        results.append({"type": itype, "intent": intent, "group_id": group_id, "result": ans})
+                        continue
+                    listing_result = listing_generate(product_info, "US", trace_id)
+                    if listing_result.get("error"):
+                        raise Exception(f"Listing生成工具异常: {listing_result['error']}")
+                    ans = (
+                        f"标题：{listing_result.get('title', '')}\n"
+                        f"五点描述：{listing_result.get('bullet_points', '')}\n"
+                        f"广告文案：{listing_result.get('ad_copy', '')}"
+                    )
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[listing][组{group_id}] Listing生成: {intent} → {str(ans)[:80]}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": str(ans)})
+
+                elif business == "product_fetch":
+                    # 商品网页抓取：从子意图文本提取URL/关键词，调用爬虫
+                    import re as _re
+                    url_pattern = _re.compile(r'https?://[^\s，。、）)】]+')
+                    url_match = url_pattern.search(intent) or url_pattern.search(agent.user_query)
+                    fetch_url = agent.original_input
+                    if url_match:
+                        fetch_url = url_match.group(0)
+                    if not fetch_url:
+                        # 没有URL：当商品关键词客服问答处理，不抛异常
+                        retriever = tenant_registry.get_for(agent.tenant_id, agent.conversation_id)
+                        docs = retriever.hybrid_search(intent, top_k=4) if retriever is not None else []
+                        qa = customer_service_qa(question=intent, retrieve_docs=docs, trace_id=trace_id)
+                        ans = qa.get("answer", "") if not qa.get("error") else f"该子意图暂无法回答"
+                        print(f"[exec_intent_node][trace_id={trace_id}] 子意图[product_fetch][组{group_id}] 无URL，回退客服: {intent} → {ans[:80]}")
+                        results.append({"type": itype, "intent": intent, "group_id": group_id, "result": ans})
+                        continue
+                    product_info = product_info_fetch(fetch_url, trace_id)
+                    if product_info.get("error"):
+                        raise Exception(f"商品抓取失败：{product_info['error']}")
+                    from agent.tools import save_product_to_knowledge
+                    save_res = save_product_to_knowledge(product_data=product_info, save_dir=r"D:\qi_agent\Agent03\rag\knowledge", trace_id=trace_id)
+                    if not save_res.get("success"):
+                        print(f"[exec_intent_node][trace_id={trace_id}] 商品文档保存警告：{save_res.get('error')}")
+                    # 更新到state供后续listing等复用（不在此节点改state，仅记录结果）
+                    product_summary = product_info.get("title", "") if isinstance(product_info, dict) else str(product_info)
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[product_fetch][组{group_id}] 商品抓取: {intent} → {str(product_summary)[:80]}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": f"已抓取商品信息：{product_summary}"})
+
+                else:
+                    # customer_service（默认）：知识库检索 + 客服问答（多租户隔离）
+                    retriever = tenant_registry.get_for(agent.tenant_id, agent.conversation_id)
+                    if retriever is None:
+                        docs = []
+                    else:
+                        docs = retriever.hybrid_search(intent, top_k=4)
+                    qa = customer_service_qa(question=intent, retrieve_docs=docs, trace_id=trace_id)
+                    ans = qa.get("answer", "") if not qa.get("error") else f"该子意图暂无法回答"
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[客服][组{group_id}] 知识库: {intent} → {ans[:80]}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": ans})
+
+            else:
+                # 非业务类：不读知识库。内部判断——命中天气/时间则调MCP工具取实时数据，否则直接对话
+                tool_need = detect_tool_need(intent)
+                if tool_need is not None and tool_need[0] == "weather":
+                    tool_result = get_weather(tool_need[1].get("city", "武汉"))
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[天气][组{group_id}] 调MCP: {intent} → {tool_result}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": tool_result})
+                elif tool_need is not None and tool_need[0] == "time":
+                    tool_result = get_time()
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[时间][组{group_id}] 调MCP: {intent} → {tool_result}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": tool_result})
+                else:
+                    # 纯对话：LLM + 对话历史（天气之外的非业务问题如"计算机就业"、闲聊都走这里，DeepSeek原生知识即可回答）
+                    msg_history = state["messages"]
+                    chat_llm = ChatDeepSeek(model="deepseek-chat", temperature=0.7)
+                    resp = chat_llm.invoke(
+                        [{"role": "system", "content": "你是跨境电商智能运营助手，根据对话历史自然回答用户，不要输出内部标记。"}]
+                        + msg_history
+                    )
+                    print(f"[exec_intent_node][trace_id={trace_id}] 子意图[对话][组{group_id}] 闲聊: {intent} → {resp.content[:80]}")
+                    results.append({"type": itype, "intent": intent, "group_id": group_id, "result": resp.content})
+
+        except Exception as e:
+            print(f"[exec_intent_node][trace_id={trace_id}] 子意图[{itype}] 执行异常: {e}")
+            results.append({"type": itype, "intent": intent, "group_id": group_id, "result": f"该子意图处理失败"})
+
+    return update_agent_state(
+        state,
+        sub_results=results,
+        sub_executed=True
+    )
+
 
 def task_parser_node(state: GraphState) -> dict[str, Any]:
     """
@@ -633,6 +1008,81 @@ def result_collect_node(state: GraphState):
     # ========== 核心改动：按任务类型，只选取当前任务的原始素材，不拼接全部内容 ==========
     task_type = agent.current_task_type
 
+    # ==========【复合意图统一规划：sub_results非空时，按 group_id 分组，同组子意图结果一起做衔接推理】==========
+    if agent.sub_executed and agent.sub_results:
+        print(f"[result_collect_node][trace_id={trace_id}] 复合意图统一规划，共 {len(agent.sub_results)} 个子结果，开始按组聚合")
+        # 1. 按 group_id 分组（保持原始出现顺序），同属一个上层问题的子意图放同一组
+        grouped = {}
+        group_order = []
+        for sr in agent.sub_results:
+            gid = sr.get("group_id", 0)
+            if gid not in grouped:
+                grouped[gid] = []
+                group_order.append(gid)
+            grouped[gid].append(sr)
+
+        # 2. 每组内部组织成块（保留类型和原文，方便LLM理解组内衔接），组间按顺序拼接
+        group_blocks = []
+        for gid in group_order:
+            members = grouped[gid]
+            member_lines = []
+            for idx, sr in enumerate(members, start=1):
+                member_lines.append(
+                    f"  子项{idx}·类型:{sr.get('type')}｜原文:{sr.get('intent', '')}\n  结果:{sr.get('result', '')}"
+                )
+            # 组内多个子意图说明是同一上层问题的不同来源，需联合推理
+            group_note = (
+                "（组内多个子项属于同一个上层问题，需将它们的结果联合起来做衔接推理）"
+                if len(members) > 1 else ""
+            )
+            group_blocks.append(
+                f"【问题组{gid}】{group_note}\n" + "\n".join(member_lines)
+            )
+        combined_material = "\n\n".join(group_blocks)
+
+        from utils.skill_loader import get_skill_loader
+        # 如果输出反思发现了问题，重新整合时把问题反馈给大模型
+        feedback_line = ""
+        if agent.output_reflection_issues:
+            feedback_line = f"\n\n⚠️上次回答被质检员指出以下问题，请这次重点修正和补全：\n{agent.output_reflection_issues}"
+
+        plan_prompt = f"""用户提出了包含多个方面的问题，Agent 已分别处理，得到多个子结果（已按问题分组）：
+{combined_material}
+{feedback_line}
+
+请把这些结果按逻辑顺序组织成一个连贯、完整、面向用户的回答。
+要求：
+1. 覆盖所有分组，不要遗漏任何一组；
+2. 同一"问题组"内如果有因果/衔接关系（例如"天气是否影响物流"，需结合该组内的天气数据和物流规则），必须在回答中把组内内容衔接起来讲清楚；
+3. 不同问题组之间，按用户提问的自然顺序依次回答；
+4. 语气自然、口语化，像真人客服，不暴露任何内部标记、分组编号、子任务信息。"""
+        try:
+            result_collect_rule = get_skill_loader().load_rule("result_collect")
+            system_content = result_collect_rule if result_collect_rule else "你是跨境电商智能运营助手，负责把多个回答片段整理成连贯的最终回答。"
+            llm = ChatDeepSeek(model="deepseek-chat", temperature=0.3)
+            resp = llm.invoke([
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": plan_prompt}
+            ])
+            final_answer = resp.content.strip()
+            print(f"[result_collect_node][trace_id={trace_id}] 复合意图分组衔接推理结果：\n{final_answer}")
+        except Exception as e:
+            print(f"[result_collect_node][trace_id={trace_id}] 复合意图统一规划异常: {str(e)}")
+            # 兜底：把子结果按组简单拼接，防止链路崩溃
+            joined = "\n".join(sr.get('result', '') for sr in agent.sub_results)
+            final_answer = joined
+
+        updated_state_dict = update_agent_state(state, final_answer=final_answer)
+        new_ai_msg = AIMessage(content=final_answer)
+        # 只返回新增消息，让MessagesState的add_messages reducer自动追加/替换
+        if agent.output_reflection_retry > 0 and state["messages"]:
+            # 反思重试：给新消息设相同id，让reducer替换最后一条旧AI消息
+            last_msg = state["messages"][-1]
+            if hasattr(last_msg, "id") and last_msg.id:
+                new_ai_msg.id = last_msg.id
+        updated_state_dict["messages"] = [new_ai_msg]
+        return updated_state_dict
+
     if agent.hit_boundary and agent.boundary_answer and agent.boundary_answer.strip():
         raw_source_data = agent.boundary_answer
         final_output["boundary_answer"] = agent.boundary_answer
@@ -672,25 +1122,158 @@ def result_collect_node(state: GraphState):
                 {"role": "system", "content": result_collect_rule},
                 {"role": "user", "content": user_prompt}
             ])
-            final_answer = f"{source_label}\n{resp.content.strip()}"
+            final_answer = resp.content.strip()
             print(f"[result_collect_node][trace_id={trace_id}] LLM整理后的结果：\n{final_answer}")
         except Exception as e:
             print(f"[result_collect_node][trace_id={trace_id}] LLM文本整理异常: {str(e)}")
             # LLM调用失败或规则缺失兜底，直接原始素材输出，防止链路崩溃
-            final_answer = f"{source_label}\n{str(raw_source_data)}"
+            final_answer = str(raw_source_data)
 
     # 更新agent_state内部字段final_answer
     updated_state_dict = update_agent_state(
         state,
         final_answer=final_answer
     )
-    # 从入参state读取messages，追加标准AIMessage对象
+    # 只返回新增AIMessage，让add_messages reducer自动追加，不要返回完整列表
     new_ai_msg = AIMessage(content=final_answer)
-    new_messages = state["messages"] + [new_ai_msg]
-    # 将更新后的消息列表写回GraphState
-    updated_state_dict["messages"] = new_messages
+    updated_state_dict["messages"] = [new_ai_msg]
     return updated_state_dict
 
+
+def output_reflection_node(state: GraphState) -> dict[str, Any]:
+    """
+    【输出反思节点】校验最终回答是否真正覆盖了用户的原始问题
+    输入：用户原始问题 + 切分的子意图列表 + 大模型刚整合好的回答
+    输出：通过则结束；不通过则记录问题，路由回 result_collect 重新整合（最多重试1次）
+    """
+    agent = state["agent_state"]
+    trace_id = agent.trace_id
+    user_query = agent.user_query
+    final_answer = agent.final_answer
+    intent_list = agent.intent_list
+
+    print(f"[output_reflection_node][trace_id={trace_id}] 开始输出反思校验")
+
+    # 构造子意图清单，方便大模型对照检查
+    intent_summary = "\n".join([
+        f"  子项{i+1}: {it.get('intent', '')} (类型:{it.get('type', '')}, business:{it.get('business', '-')})"
+        for i, it in enumerate(intent_list)
+    ])
+
+    # 构造各子意图实际执行结果，让反思节点知道哪些信息是真实查到的
+    sub_results_summary = ""
+    try:
+        sr_list = agent.sub_results or []
+        if sr_list:
+            sr_lines = []
+            for i, sr in enumerate(sr_list):
+                r_type = sr.get("type", "")
+                r_intent = sr.get("intent", "")
+                r_result = str(sr.get("result", ""))[:300]
+                sr_lines.append(f"  [{r_type}] {r_intent} → {r_result}")
+            sub_results_summary = "各子意图实际执行结果（这些是真实查到的信息，不算编造）：\n" + "\n".join(sr_lines) + "\n"
+    except Exception:
+        pass
+
+    # 取最近几轮对话历史，让反思节点知道用户之前说过什么（否则会把基于历史的回答误判为编造）
+    recent_history = ""
+    try:
+        msgs = state.get("messages", [])
+        # 取最近6条（3轮对话），去掉最后一条刚加的HumanMessage
+        recent = msgs[-7:-1] if len(msgs) > 1 else []
+        if recent:
+            history_lines = []
+            for m in recent:
+                role = "用户" if m.type == "human" else "助手"
+                history_lines.append(f"  [{role}] {m.content[:150]}")
+            recent_history = "对话历史（用户之前说过的内容）：\n" + "\n".join(history_lines) + "\n"
+    except Exception:
+        pass
+
+    prompt = f"""你是回答质检员。请对照用户原始问题和最终回答，检查回答是否合格。
+
+{recent_history}
+{sub_results_summary}
+用户当前问题：{user_query}
+
+系统拆出的子意图清单：
+{intent_summary}
+
+系统给出的最终回答：
+{final_answer}
+
+请严格按以下标准检查，只输出JSON：
+{{"pass": true/false, "issues": "如果不通过，说明具体遗漏了什么或哪里答偏了；如果通过就留空"}}
+
+判断标准：
+1. 用户问的每个子意图，回答里都要有所体现，不能遗漏；
+2. 回答不能答非所问；如果信息来自对话历史或上面"各子意图实际执行结果"，不算编造；
+3. 如果某个子意图执行结果是"没有找到/查不到"，回答里要诚实说明，不能把别的子意图结果张冠李戴；
+4. 只输出JSON，不要多余文字。"""
+
+    passed = False
+    issues = ""
+    try:
+        llm = ChatDeepSeek(model="deepseek-chat", temperature=0)
+        resp = llm.invoke(prompt)
+        data = safe_parse_json(resp.content.strip(), trace_id)
+        passed = bool(data.get("pass", False))
+        issues = str(data.get("issues", ""))
+    except Exception as e:
+        print(f"[output_reflection_node][trace_id={trace_id}] 输出反思解析异常: {str(e)}")
+        # 反思本身出错，不阻断流程，直接放行
+        passed = True
+        issues = ""
+
+    if passed:
+        print(f"[output_reflection_node][trace_id={trace_id}] 输出反思通过，回答合格")
+        return update_agent_state(state, output_reflection_issues="")
+    else:
+        retry = agent.output_reflection_retry
+        print(f"[output_reflection_node][trace_id={trace_id}] 输出反思发现问题(第{retry+1}次): {issues[:100]}")
+        # 如果已经重试过1次还是不通过，在最终回答前面加提示，然后结束
+        if retry >= 1:
+            warning = "⚠️ 以上回答可能存在遗漏或考虑不完整，如需更准确的信息请补充说明后再问。\n\n"
+            warned_answer = warning + agent.final_answer
+            print(f"[output_reflection_node][trace_id={trace_id}] 已达重试上限，附加不完整提示后结束")
+            result = update_agent_state(
+                state,
+                final_answer=warned_answer,
+                output_reflection_issues=""  # 清空，让路由走END
+            )
+            # 给新AIMessage设相同id，让reducer替换最后一条旧AI消息
+            if state["messages"]:
+                last_msg = state["messages"][-1]
+                warned_msg = AIMessage(content=warned_answer)
+                if hasattr(last_msg, "id") and last_msg.id:
+                    warned_msg.id = last_msg.id
+                result["messages"] = [warned_msg]
+            return result
+        else:
+            return update_agent_state(
+                state,
+                output_reflection_issues=issues,
+                output_reflection_retry=retry + 1
+            )
+
+
+def route_after_output_reflection(state: GraphState) -> Literal["result_collect", "__end__"]:
+    """
+    输出反思后的路由：
+    - 已重试过1次 → 直接结束（避免死循环）
+    - 未通过且未超次数 → 回 result_collect 重新整合
+    - 通过 → 直接结束
+    """
+    agent = state["agent_state"]
+    retry = agent.output_reflection_retry
+    issues = agent.output_reflection_issues
+
+    if issues and retry <= 1:
+        print(f"[route_after_output_reflection][trace_id={agent.trace_id}] 回答有问题，回result_collect重新整合(第{retry}次)")
+        return "result_collect"
+    else:
+        print(f"[route_after_output_reflection][trace_id={agent.trace_id}] 回答合格或已达重试上限，结束")
+        return "__end__"
 
 
 # ====================================================================================

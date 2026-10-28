@@ -1,34 +1,28 @@
 """ LangGraph 构图模块 graph_builder.py 组装全部节点、条件边，返回可编译运行的Agent图实例
 外部 main.py 需要传入全局的 hybrid_retriever (RAG混合检索对象)
-改造后工作流：
-pre_rag_retrieve_node → query_rewrite_node → boundary_judge_node → need_knowledge_judge_node
-    ├ need_retrieve=True → do_retrieve_node → task_parser_node → task_router → exec_task_dispatcher → task_router（循环执行子任务）
-    └ need_retrieve=False → task_parser_node → task_router → exec_task_dispatcher → task_router（循环执行子任务）
-全部任务完成 / 报错 / 重试超限 / hit_boundary=True → result_collect_node → END
+统一链路工作流（方案1：单意图/复合意图完全同构）：
+pre_rag_retrieve → intent_split(切分+补全+分组+business) → reflection_check(反思校验)
+    → intent_execute(统一执行：按 type/business 路由到客服/销量/竞品/listing/抓取/MCP天气时间/闲聊)
+    → result_collect(统一出口：结合原句+子结果，大模型整合，输出校验) → END
+所有输入都走同一条链路，不再分"复合/单意图"两条路。
 """
 from typing import Any
 from functools import partial
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import AIMessage
 from langchain_deepseek import ChatDeepSeek
 from agent.state import GraphState
 from langgraph.checkpoint.memory import MemorySaver
 from utils.helper import update_agent_state, generate_trace_id
 
-# ==========【更新导入：新增query_rewrite_node】==========
 from agent.nodes import (
     pre_rag_retrieve_node,
-    query_rewrite_node,
-    boundary_judge_node,
-    route_after_boundary,
-    need_knowledge_judge_node,
-    route_knowledge_judge,
-    do_retrieve_node,
-    task_parser_node,
-    task_router,
-    exec_task_dispatcher,
+    intent_split_node,
+    reflection_check_node,
+    route_after_split,
+    exec_intent_node,
     result_collect_node,
-    increase_task_index
+    output_reflection_node,
+    route_after_output_reflection,
 )
 
 from agent.tools import (
@@ -39,90 +33,67 @@ from agent.tools import (
     customer_service_qa
 )
 
-# ===================== 已删除此处旧版exec_task_dispatcher函数，统一使用agent.nodes.exec_task_dispatcher =====================
 def build_graph(tenant_registry):
     """
     构建并返回编译后的 StateGraph 实例
     :param tenant_registry: 租户检索注册表(rag.tenant_registry.TenantRetrieverRegistry)，main.py创建传入
-                            do_retrieve 按 state.tenant_id 取对应企业的检索器，实现多租户知识库隔离
+                            执行节点按 tenant_id+conversation_id 取对应对话检索器，实现多租户知识库隔离
     :return: compiled_graph
     """
     memory_saver = MemorySaver()
     graph = StateGraph(GraphState)
 
-    # ========= 注册节点【新增 query_rewrite】 =========
+    # ========= 注册节点（统一链路） =========
     graph.add_node("pre_rag_retrieve", pre_rag_retrieve_node)
-    graph.add_node("query_rewrite", query_rewrite_node)
-    graph.add_node("boundary_judge", boundary_judge_node)
-    graph.add_node("knowledge_judge", need_knowledge_judge_node)
-    graph.add_node("do_retrieve", partial(do_retrieve_node, tenant_registry=tenant_registry))
-    graph.add_node("task_parser", task_parser_node)
-    # 使用 partial 注入参数，规避lambda闭包捕获问题，调用nodes内的exec_task_dispatcher
-    graph.add_node("exec_task", partial(exec_task_dispatcher, tenant_registry=tenant_registry))
+    graph.add_node("intent_split", intent_split_node)
+    graph.add_node("reflection_check", reflection_check_node)
+    graph.add_node("intent_execute", partial(exec_intent_node, tenant_registry=tenant_registry))
     graph.add_node("result_collect", result_collect_node)
+    graph.add_node("output_reflection", output_reflection_node)
 
     # ========= 设置入口点【启动首先运行 pre_rag_retrieve】 =========
     graph.set_entry_point("pre_rag_retrieve")
 
-    # ========= 修改链路：pre_rag_retrieve → query_rewrite → boundary_judge =========
-    graph.add_edge("pre_rag_retrieve", "query_rewrite")
-    graph.add_edge("query_rewrite", "boundary_judge")
+    # ========= 统一链路：pre_rag_retrieve → intent_split → reflection_check → intent_execute → result_collect → output_reflection =========
+    graph.add_edge("pre_rag_retrieve", "intent_split")
+    graph.add_edge("intent_split", "reflection_check")
 
-    # ========= 边界条件路由 =========
+    # 反思后统一路由：所有意图（单/复合）都走 intent_execute
     graph.add_conditional_edges(
-        source="boundary_judge",
-        path=route_after_boundary,
+        source="reflection_check",
+        path=route_after_split,
         path_map={
-            "task_parser_node": "knowledge_judge",
-            "result_collect": "result_collect"
+            "intent_execute": "intent_execute"
         }
     )
 
-    # ========= 新增：知识相关性判断路由 =========
-    graph.add_conditional_edges(
-        source="knowledge_judge",
-        path=route_knowledge_judge,
-        path_map={
-            "do_retrieve_node": "do_retrieve",
-            "task_parser_node": "task_parser"
-        }
-    )
-    # do_retrieve执行完成后，进入任务解析节点
-    graph.add_edge("do_retrieve", "task_parser")
+    # 统一执行完成后，进入统一结果汇总
+    graph.add_edge("intent_execute", "result_collect")
 
-    # ========= 原有链路（完全不变） =========
-    # task_parser执行完成，走条件路由
+    # 汇总后进入输出反思校验
+    graph.add_edge("result_collect", "output_reflection")
+
+    # 输出反思后路由：通过则结束；不通过且未超次数则回 result_collect 重新整合
     graph.add_conditional_edges(
-        source="task_parser",
-        path=task_router,
+        source="output_reflection",
+        path=route_after_output_reflection,
         path_map={
-            "exec_task": "exec_task",
-            "end": "result_collect"
+            "result_collect": "result_collect",
+            "__end__": END
         }
     )
 
-    # exec_task执行完再次走task_router
-    graph.add_conditional_edges(
-        source="exec_task",
-        path=task_router,
-        path_map={
-            "exec_task": "exec_task",
-            "end": "result_collect"
-        }
-    )
-
-    # 汇总完成直接结束
-    graph.add_edge("result_collect", END)
-
-    # 编译图，注入内存checkpoint ✅修复点
+    # 编译图，注入内存checkpoint
     compiled_graph = graph.compile(checkpointer=memory_saver)
     return compiled_graph
+
 
 # ===================== 自测代码 =====================
 if __name__ == "__main__":
     print("==== graph_builder 模块自测 ====")
     from agent.state import AgentState, GraphState
     from utils.helper import generate_trace_id
+    from langchain_core.messages import AIMessage
 
     # mock一个租户注册表，自测不需要真实RAG
     class MockRetriever:
@@ -132,11 +103,13 @@ if __name__ == "__main__":
     class MockRegistry:
         def get(self, tenant_id):
             return MockRetriever()
+        def get_for(self, tenant_id, conversation_id):
+            return MockRetriever()
 
     mock_registry = MockRegistry()
     agent_graph = build_graph(mock_registry)
 
-    # case1：商品相关query，预期 need_retrieve=True，来源标记 platform_knowledge
+    # case1：商品相关query
     print("\n==== Case1：商品相关问题【简单介绍蓝牙耳机】 ====")
     trace_id = generate_trace_id()
     init_agent_state = AgentState(
@@ -147,25 +120,20 @@ if __name__ == "__main__":
         "messages": [("user", "简单介绍蓝牙耳机")],
         "agent_state": init_agent_state
     }
-    # 新增 config，必须传 thread_id
     config = {"configurable": {"thread_id": "test-thread-001"}}
     result = agent_graph.invoke(input_graph_state, config=config)
     final_agent = result["agent_state"]
     print(f"\n✅执行完成 trace_id={final_agent.trace_id}")
-    print(f"need_retrieve: {final_agent.need_retrieve}, answer_source: {final_agent.answer_source}")
-    print(f"task_list: {final_agent.task_list}")
-    print(f"current_task_index: {final_agent.current_task_index}")
-    # 兼容元组 / AIMessage 对象两种格式
+    print(f"answer_source: {final_agent.answer_source}")
+    print(f"intent_list: {final_agent.intent_list}")
     last_msg = result["messages"][-1]
-    if isinstance(last_msg, tuple):
-        ai_text = last_msg[1]
-    elif isinstance(last_msg, AIMessage):
+    if isinstance(last_msg, AIMessage):
         ai_text = last_msg.content
     else:
         ai_text = str(last_msg)
     print(f"\n📨最终AI消息：{ai_text}")
 
-    # case2：无关业务query，预期 need_retrieve=False，来源标记 llm_knowledge
+    # case2：非电商query
     print("\n==== Case2：非电商问题【计算机怎么就业】 ====")
     trace_id2 = generate_trace_id()
     init_agent_state2 = AgentState(
@@ -176,16 +144,13 @@ if __name__ == "__main__":
         "messages": [("user", "计算机怎么就业")],
         "agent_state": init_agent_state2
     }
-    # 新增 config
     config2 = {"configurable": {"thread_id": "test-thread-002"}}
     result2 = agent_graph.invoke(input_graph_state2, config=config2)
     final_agent2 = result2["agent_state"]
     print(f"\n✅执行完成 trace_id={final_agent2.trace_id}")
-    print(f"need_retrieve: {final_agent2.need_retrieve}, answer_source: {final_agent2.answer_source}")
+    print(f"answer_source: {final_agent2.answer_source}")
     last_msg2 = result2["messages"][-1]
-    if isinstance(last_msg2, tuple):
-        ai_text2 = last_msg2[1]
-    elif isinstance(last_msg2, AIMessage):
+    if isinstance(last_msg2, AIMessage):
         ai_text2 = last_msg2.content
     else:
         ai_text2 = str(last_msg2)
