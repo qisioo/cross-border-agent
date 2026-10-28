@@ -499,24 +499,39 @@ async def agent_run(req: AgentRequest):
         raise HTTPException(status_code=500, detail=f"服务内部异常：{err_msg}")
 
 
-# ==========【SSE 流式接口（新增，不影响 /api/agent/run 与 Streamlit 前端）】==========
-async def _execute_agent(req: AgentRequest) -> str:
-    """执行 Agent 并返回清洗后的 final_answer（供流式接口复用；/api/agent/run 保持不变）"""
+# ==========【SSE 流式接口（LangGraph 原生流式）】==========
+# 节点名称到中文提示的映射
+NODE_NAME_MAP = {
+    "pre_rag_retrieve": "正在前置检索...",
+    "intent_split": "正在切分意图...",
+    "reflection_check": "正在反思校验...",
+    "intent_execute": "正在执行任务...",
+    "result_collect": "正在汇总结果...",
+    "output_reflection": "正在输出校验...",
+}
+
+
+@app.post("/api/agent/stream")
+async def agent_stream(req: AgentRequest):
+    """SSE 流式接口（LangGraph 原生流式）：推送节点执行过程 + token 级流式输出"""
+    if agent_graph is None:
+        raise HTTPException(status_code=503, detail="Agent服务尚未初始化，请稍后重试")
     user_query = req.user_query.strip()
+    if not user_query:
+        raise HTTPException(status_code=400, detail="user_query不能为空")
+    if len(user_query) > MAX_QUERY_LENGTH:
+        raise HTTPException(status_code=400, detail=f"输入不能超过{MAX_QUERY_LENGTH}字符")
+
     trace_id = generate_trace_id()
     print(f"[api/stream][trace_id={trace_id}] receive request, query={user_query[:120]}")
 
     session_id = req.session_id or "sess-default-001"
     tenant_id = (req.tenant_id or "default").strip() or "default"
     conversation_id = (req.conversation_id or "").strip() or ""
-    # 多租户 + 对话级隔离：thread_id 前缀企业id与对话id，隔离不同企业/不同对话的历史，绝不跨对话
     thread_id = f"{tenant_id}:{conversation_id}:{session_id}" if conversation_id else f"{tenant_id}:{session_id}"
     config = {"configurable": {"thread_id": thread_id}}
 
-    # LangGraph checkpoint 自动恢复历史 messages，只需传新消息
-    payload = {"messages": [HumanMessage(content=user_query)]}
-
-    # 前置重置 checkpoint 里的 agent_state（与 /api/agent/run 一致）
+    # 前置重置 checkpoint 里的 agent_state
     from agent.state import AgentState
     clean_agent_state = AgentState(
         user_query=user_query,
@@ -541,61 +556,68 @@ async def _execute_agent(req: AgentRequest) -> str:
     )
     agent_graph.update_state(config, {"agent_state": clean_agent_state})
 
-    result = await asyncio.wait_for(
-        agent_graph.ainvoke(payload, config=config),
-        timeout=AGENT_RUN_TIMEOUT
-    )
-
-    agent_state_obj = result.get("agent_state")
-    final_answer = ""
-    if agent_state_obj and hasattr(agent_state_obj, "final_answer") and agent_state_obj.final_answer:
-        final_answer = agent_state_obj.final_answer
-    elif agent_state_obj and hasattr(agent_state_obj, "competitor_report") and agent_state_obj.competitor_report:
-        final_answer = agent_state_obj.competitor_report
-    else:
-        msg_list = result.get("messages", [])
-        if msg_list and isinstance(msg_list[-1], AIMessage):
-            final_answer = msg_list[-1].content
-
-    # 兜底正则清洗，干掉子任务标记（与 /api/agent/run 一致）
-    import re
-    pattern = re.compile(r"---【子任务\d+】.*?\n|【子任务中间结果】", re.MULTILINE)
-    final_answer = pattern.sub("", final_answer)
-    final_answer = re.sub(r"\n\s*\n", "\n\n", final_answer).strip()
-
-    print(f"[api/stream][trace_id={trace_id}] 执行完成，回答长度={len(final_answer)}")
-    return final_answer
-
-
-@app.post("/api/agent/stream")
-async def agent_stream(req: AgentRequest):
-    """SSE 流式接口（新增）：执行 Agent 后把回答按小块逐块流式返回，前端可做打字机效果"""
-    if agent_graph is None:
-        raise HTTPException(status_code=503, detail="Agent服务尚未初始化，请稍后重试")
-    user_query = req.user_query.strip()
-    if not user_query:
-        raise HTTPException(status_code=400, detail="user_query不能为空")
-    if len(user_query) > MAX_QUERY_LENGTH:
-        raise HTTPException(status_code=400, detail=f"输入不能超过{MAX_QUERY_LENGTH}字符")
-
-    try:
-        final_answer = await _execute_agent(req)
-    except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"Agent执行超时({AGENT_RUN_TIMEOUT}秒)")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"服务内部异常：{str(e)}")
+    payload = {"messages": [HumanMessage(content=user_query)]}
 
     async def event_gen():
-        # 起始事件
-        yield f"data: {json.dumps({'type': 'start'}, ensure_ascii=False)}\n\n"
-        # 按小块分块发送，前端逐块渲染形成打字机效果
-        step = 4
-        for i in range(0, len(final_answer), step):
-            chunk = final_answer[i:i + step]
-            yield f"data: {json.dumps({'type': 'delta', 'content': chunk}, ensure_ascii=False)}\n\n"
-            await asyncio.sleep(0.02)
-        # 结束事件
-        yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
+        try:
+            # 起始事件
+            yield f"data: {json.dumps({'type': 'start', 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
+
+            final_answer = ""
+
+            # 用 LangGraph 的原生流式能力，stream_mode="updates" 推送节点执行过程
+            async for event in agent_graph.astream(payload, config=config, stream_mode="updates"):
+                # event 是一个字典，key 是节点名称，value 是该节点的输出
+                for node_name, node_output in event.items():
+                    # 推送节点执行提示
+                    node_hint = NODE_NAME_MAP.get(node_name, f"正在执行 {node_name}...")
+                    yield f"data: {json.dumps({'type': 'node', 'node': node_name, 'hint': node_hint}, ensure_ascii=False)}\n\n"
+
+                    # 检查是否有 final_answer 输出
+                    if isinstance(node_output, dict) and "agent_state" in node_output:
+                        agent_state = node_output["agent_state"]
+                        if hasattr(agent_state, "final_answer") and agent_state.final_answer:
+                            final_answer = agent_state.final_answer
+
+            # 兜底：如果没有从节点输出拿到 final_answer，从结果里拿
+            if not final_answer:
+                result = await asyncio.wait_for(
+                    agent_graph.ainvoke(payload, config=config),
+                    timeout=AGENT_RUN_TIMEOUT
+                )
+                agent_state_obj = result.get("agent_state")
+                if agent_state_obj and hasattr(agent_state_obj, "final_answer") and agent_state_obj.final_answer:
+                    final_answer = agent_state_obj.final_answer
+                elif agent_state_obj and hasattr(agent_state_obj, "competitor_report") and agent_state_obj.competitor_report:
+                    final_answer = agent_state_obj.competitor_report
+                else:
+                    msg_list = result.get("messages", [])
+                    if msg_list and isinstance(msg_list[-1], AIMessage):
+                        final_answer = msg_list[-1].content
+
+            # 正则清洗
+            import re
+            pattern = re.compile(r"---【子任务\d+】.*?\n|【子任务中间结果】", re.MULTILINE)
+            final_answer = pattern.sub("", final_answer)
+            final_answer = re.sub(r"\n\s*\n", "\n\n", final_answer).strip()
+
+            print(f"[api/stream][trace_id={trace_id}] 执行完成，回答长度={len(final_answer)}")
+
+            # 推送 token 级流式输出（模拟打字机效果）
+            step = 4
+            for i in range(0, len(final_answer), step):
+                chunk = final_answer[i:i + step]
+                yield f"data: {json.dumps({'type': 'delta', 'content': chunk}, ensure_ascii=False)}\n\n"
+                await asyncio.sleep(0.02)
+
+            # 结束事件
+            yield f"data: {json.dumps({'type': 'done', 'trace_id': trace_id}, ensure_ascii=False)}\n\n"
+
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Agent执行超时({AGENT_RUN_TIMEOUT}秒)'}, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            print(f"[api/stream][trace_id={trace_id}] 异常: {str(e)}")
+            yield f"data: {json.dumps({'type': 'error', 'message': f'服务内部异常：{str(e)}'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
